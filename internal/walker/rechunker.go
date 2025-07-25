@@ -2,8 +2,8 @@ package walker
 
 import (
 	"context"
-	"errors"
 	"fmt"
+	"io"
 
 	"github.com/restic/chunker"
 	"github.com/restic/restic/internal/bloblru"
@@ -40,6 +40,8 @@ type FileRechunker struct {
 	// chnker    *chunker.Chunker
 }
 
+const blobCacheSize = 64 << 20  // same with fuse.blobCacheSize
+
 func NewFileRechunker(srcRepo restic.BlobLoader, dstRepo restic.BlobSaver, dstRepoPol chunker.Pol) *FileRechunker {
 	return &FileRechunker{
 		srcRepo: 			srcRepo,
@@ -52,7 +54,8 @@ func NewFileRechunker(srcRepo restic.BlobLoader, dstRepo restic.BlobSaver, dstRe
 }
 
 func (rc *FileRechunker) RechunkData(ctx context.Context, root restic.ID) error {
-	ch := make(chan restic.IDs)
+	numWorkers := 2  // TODO: make it configurable
+	chFile := make(chan restic.IDs, numWorkers)
 	visitor := WalkVisitor{
 		ProcessNode: func(_ restic.ID, _ string, node *restic.Node, nodeErr error) error {
 			// skip non-file nodes
@@ -68,37 +71,142 @@ func (rc *FileRechunker) RechunkData(ctx context.Context, root restic.ID) error 
 			rc.visitedBlobs[ids] = struct{}{}
 
 			select {
-			case ch <- node.Content:
+			case chFile <- node.Content:
 			case <-ctx.Done():
 				return ctx.Err()
 			}
 			return nil
 		},
 	}
+	blobCache := bloblru.New(blobCacheSize)
 
 	// create rechunk workers
-	numWorkers := 4  // TODO: make it configurable
-	wg, wgCtx := errgroup.WithContext(ctx)
+	wgUp, wgUpCtx := errgroup.WithContext(ctx)
 	for i := 0; i < numWorkers; i++ {
-		wg.Go(func() error {
-			var srcBlobs restic.IDs
-			var dstBlobs restic.IDs
-			// where should I put chunkers?
-			// is it better to place it globally for performance?
+		wgUp.Go(func() error {
 			chnker := chunker.New(nil, rc.dstRepoPol)
+			chReuseBuf := make(chan []byte, 1)
+			wg, wgCtx := errgroup.WithContext(wgUpCtx)
+
 			for {
+				var srcBlobs restic.IDs
+				var ok bool
 				select {
-				case <-wgCtx.Done():  // context cancelled
-					return wgCtx.Err()
-				case b, ok := <-ch:
+				case <-wgUpCtx.Done():  // context cancelled
+					return wgUpCtx.Err()
+				case srcBlobs, ok = <-chFile:
 					if !ok {  // chan closed and drained
 						return nil
 					}
-					srcBlobs = b
 				}
-				// rechunk srcBlobs to dstBlobs
-				// seems I need to implement buffer manually...
-				// reference implementation: cmd_dump.go, file_saver.go
+				dstBlobs := restic.IDs{}
+				
+				// run downloader/iopipe/chunker/uploader goroutine
+				// downloader
+				chDownload := make(chan []byte)
+				wg.Go(func() error {
+					for _, blobID := range srcBlobs {
+						buf, err := blobCache.GetOrCompute(blobID, func() ([]byte, error) {
+							return rc.srcRepo.LoadBlob(wgCtx, restic.DataBlob, blobID, nil)
+						})
+						if err != nil {
+							return err
+						}
+
+						select {
+						case <-wgCtx.Done():
+							return wgCtx.Err()
+						case chDownload <- buf:
+						}
+					}
+					
+					close(chDownload)
+					return nil
+				})
+
+				// iopipe
+				r, w := io.Pipe()
+				wg.Go(func() error {
+					for {
+						var buf []byte
+						var ok bool
+						select {
+						case <-wgCtx.Done():
+							return wgCtx.Err()
+						case buf, ok = <- chDownload:
+							if !ok {  // EOF
+								w.Close()
+								return nil
+							}
+						}
+
+						_, err := w.Write(buf)
+						if err != nil {
+							return err
+						}
+					}
+				})
+				
+				// chunker
+				chnker.Reset(r, rc.dstRepoPol)
+				chUpload := make(chan []byte)
+				wg.Go(func() error {
+					for {
+						var buf []byte
+						select {
+						case buf = <-chReuseBuf:
+						default:
+							buf = make([]byte, chunker.MaxSize)
+						}
+
+						chunk, err := chnker.Next(buf)
+						if err == io.EOF {
+							close(chUpload)
+							return nil
+						}
+						if err != nil {
+							return err
+						}
+
+						select {
+						case <-wgCtx.Done():
+							return wgCtx.Err()
+						case chUpload <- chunk.Data:
+						}
+					}
+				})
+
+				// uploader
+				wg.Go(func() error {
+					for {
+						var blobData []byte
+						var ok bool
+						select {
+						case <-wgCtx.Done():
+							return wgCtx.Err()
+						case blobData, ok = <-chUpload:
+							if !ok {  // EOF
+								return nil
+							}
+						}
+
+						blobID, _, _, err := rc.dstRepo.SaveBlob(ctx, restic.DataBlob, blobData, restic.ID{}, false)
+						if err != nil {
+							return err
+						}
+
+						select {
+						case chReuseBuf <- blobData:
+						default:
+						}
+						dstBlobs = append(dstBlobs, blobID)
+					}
+				})
+
+				err := wg.Wait()
+				if err != nil {
+					return err
+				}
 
 				// register to rechunkMap
 				rc.rechunkBlobsMap[srcBlobs.String()] = BlobIDsPair{
@@ -111,11 +219,11 @@ func (rc *FileRechunker) RechunkData(ctx context.Context, root restic.ID) error 
 
 	// call Walk(): register jobs to ch
 	err := Walk(ctx, rc.srcRepo, root, visitor)
-	close(ch)
+	close(chFile)
 	if err != nil {
 		return err
 	}
-	return wg.Wait()
+	return wgUp.Wait()
 }
 
 func (rc *FileRechunker) rewriteNode(node *restic.Node) error {
