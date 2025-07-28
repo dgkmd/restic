@@ -2,12 +2,10 @@ package walker
 
 import (
 	"context"
-	"fmt"
 	"testing"
 
 	"github.com/restic/chunker"
 	"github.com/restic/restic/internal/archiver"
-	"github.com/restic/restic/internal/fs"
 	"github.com/restic/restic/internal/repository"
 	"github.com/restic/restic/internal/restic"
 	rtest "github.com/restic/restic/internal/test"
@@ -38,27 +36,32 @@ import (
 
 
 func TestRechunker(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	repository.TestUseLowSecurityKDFParameters(t)
 
 	// prepare repositories
-	srcChunkerPol, _ := chunker.RandomPolynomial()
-	dstChunkerPol, _ := chunker.RandomPolynomial()
-
 	srcRepo, _ := repository.New(repository.TestBackend(t), repository.Options{})
 	dstTestsRepo, _ := repository.New(repository.TestBackend(t), repository.Options{})
 	dstWantsRepo, _ := repository.New(repository.TestBackend(t), repository.Options{})
 
-	ctx := context.TODO()
-	ver := uint(restic.StableRepoVersion)
-	pw := rtest.TestPassword
-	srcRepo.Init(ctx, ver, pw, &srcChunkerPol)
-	dstTestsRepo.Init(ctx, ver, pw, &dstChunkerPol)
-	dstWantsRepo.Init(ctx, ver, pw, &dstChunkerPol)
+	srcChunkerParam, _ := chunker.RandomPolynomial()
+	dstChunkerParam, _ := chunker.RandomPolynomial()
+
+	repoVer := uint(restic.StableRepoVersion)
+	repoPw := rtest.TestPassword
+	_ = srcRepo.Init(ctx, repoVer, repoPw, &srcChunkerParam)
+	_ = dstTestsRepo.Init(ctx, repoVer, repoPw, &dstChunkerParam)
+	_ = dstWantsRepo.Init(ctx, repoVer, repoPw, &dstChunkerParam)
 
 	// prepare test data
 	src := archiver.TestDir{
-		"aaa": archiver.TestFile{Content: string(rtest.Random(42, 123))},
-		"bbb": archiver.TestFile{Content: string(rtest.Random(42, 123456))},
-		"ccc": archiver.TestFile{Content: string(rtest.Random(42, 123456789))},
+		"zero": archiver.TestFile{Content: ""},
+		"tiny": archiver.TestFile{Content: string(rtest.Random(42, 123))},
+		"small": archiver.TestFile{Content: string(rtest.Random(42, 123_456))},
+		"floppy": archiver.TestFile{Content: string(rtest.Random(42, 1_234_567))},
+		"medium": archiver.TestFile{Content: string(rtest.Random(42, 12_345_678))},
+		"large": archiver.TestFile{Content: string(rtest.Random(42, 123_456_789))},
 	}
 	tempDir := rtest.TempDir(t)
 	archiver.TestCreateFiles(t, tempDir, src)
@@ -66,11 +69,14 @@ func TestRechunker(t *testing.T) {
 
 	// archive data to the repos with archiver
 	srcSn := archiver.TestSnapshot(t, srcRepo, tempDir, nil)
-	dstWantsSn := archiver.TestSnapshot(t, dstWantsRepo, tempDir, nil)
+	_ = archiver.TestSnapshot(t, dstWantsRepo, tempDir, nil)
 
 	// do rechunking to dstTestRepo
+	wg, wgCtx := errgroup.WithContext(ctx)
+	dstTestsRepo.StartPackUploader(wgCtx, wg)
 	rechunker := NewFileRechunker(srcRepo, dstTestsRepo, dstTestsRepo.Config().ChunkerPolynomial)
 	rechunker.RechunkData(ctx, *srcSn.Tree)
+	dstTestsRepo.Flush(ctx)
 
 	// compare data blobs between dstWantsRepo and dstTestRepo
 	blobWants := restic.IDs{}
@@ -79,10 +85,20 @@ func TestRechunker(t *testing.T) {
 			blobWants = append(blobWants, pb.ID)
 		}
 	})
+
+	// blobTests := restic.IDs{}
+	// dstTestsRepo.ListBlobs(ctx, func(pb restic.PackedBlob) {
+	// 	if pb.Type == restic.DataBlob {
+	// 		blobTests = append(blobTests, pb.ID)
+	// 	}
+	// })
+	// fmt.Printf("Wanted blobs: %v\n", blobWants.String())
+	// fmt.Printf("Tested blobs: %v\n", blobTests.String())
+
 	for _, blobID := range blobWants {
 		_, ok := dstTestsRepo.LookupBlobSize(restic.DataBlob, blobID)
 		if !ok {
-			t.Errorf("Blob mismatch: %v", blobID)
+			t.Errorf("Blob missing: %v", blobID)
 		}
 	}
 }
