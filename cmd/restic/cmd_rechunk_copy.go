@@ -1,29 +1,27 @@
-// plan: open repos -> 
+// plan: open repos ->
 
 package main
 
 import (
 	"context"
-	"fmt"
 
 	"github.com/restic/restic/internal/debug"
-	"github.com/restic/restic/internal/errors"
-	"github.com/restic/restic/internal/repository"
 	"github.com/restic/restic/internal/restic"
+	"github.com/restic/restic/internal/walker"
 	"golang.org/x/sync/errgroup"
 
 	"github.com/spf13/cobra"
 	"github.com/spf13/pflag"
 )
 
-func newRechunkCommand() *cobra.Command {
-	var opts RechunkOptions
+func newRechunkCopyCommand() *cobra.Command {
+	var opts RechunkCopyOptions
 	cmd := &cobra.Command{
-		Use:   "rechunk [flags] [snapshotID ...]",
+		Use:               "rechunk-copy [flags] [snapshotID ...]",
 		GroupID:           cmdGroupDefault,
 		DisableAutoGenTag: true,
 		RunE: func(cmd *cobra.Command, args []string) error {
-			return runRechunk(cmd.Context(), opts, globalOptions, args)
+			return runRechunkCopy(cmd.Context(), opts, globalOptions, args)
 		},
 	}
 
@@ -31,33 +29,18 @@ func newRechunkCommand() *cobra.Command {
 	return cmd
 }
 
-// RechunkOptions bundles all options for the copy command.
-type RechunkOptions struct {
+// RechunkCopyOptions bundles all options for the copy command.
+type RechunkCopyOptions struct {
 	secondaryRepoOptions
 	restic.SnapshotFilter
 }
 
-func (opts *RechunkOptions) AddFlags(f *pflag.FlagSet) {
+func (opts *RechunkCopyOptions) AddFlags(f *pflag.FlagSet) {
 	opts.secondaryRepoOptions.AddFlags(f, "destination", "to copy snapshots from")
 	initMultiSnapshotFilter(f, &opts.SnapshotFilter, true)
 }
 
-type idMap map[restic.ID]restic.ID
-
-type rechunkFileJob struct {
-	srcBlobs restic.IDs
-	dstBlobs restic.IDs
-	node     *restic.Node
-}
-
-type Rechunker struct {}
-
-func (rch *Rechunker) commit() error {
-	// after rechunking and upload, write dstBlobs to node.Content and notify to tree rewriter
-	return nil
-}
-
-func runRechunk(ctx context.Context, opts RechunkOptions, gopts GlobalOptions, args []string) error {
+func runRechunkCopy(ctx context.Context, opts RechunkCopyOptions, gopts GlobalOptions, args []string) error {
 	secondaryGopts, isFromRepo, err := fillSecondaryGlobalOpts(ctx, opts.secondaryRepoOptions, gopts, "destination")
 	if err != nil {
 		return err
@@ -112,13 +95,33 @@ func runRechunk(ctx context.Context, opts RechunkOptions, gopts GlobalOptions, a
 		return ctx.Err()
 	}
 
-	// remember already processed trees across all snapshots
-	visitedTrees := make(idMap)
+	rechunker := walker.NewRechunker(srcRepo, dstRepo, dstRepo.Config().ChunkerPolynomial)
 
 	for sn := range FindFilteredSnapshots(ctx, srcSnapshotLister, srcRepo, &opts.SnapshotFilter, args) {
+		// check whether the destination has a snapshot with the same persistent ID which has similar snapshot fields
+		srcOriginal := *sn.ID()
+		if sn.Original != nil {
+			srcOriginal = *sn.Original
+		}
+
+		if originalSns, ok := dstSnapshotByOriginal[srcOriginal]; ok {
+			isCopy := false
+			for _, originalSn := range originalSns {
+				if similarSnapshots(originalSn, sn) {
+					Verboseff("\n%v\n", sn)
+					Verboseff("skipping source snapshot %s, was already copied to snapshot %s\n", sn.ID().Str(), originalSn.ID().Str())
+					isCopy = true
+					break
+				}
+			}
+			if isCopy {
+				continue
+			}
+		}
 		Verbosef("\n%v\n", sn)
-		Verbosef("  rechunk copy started, this may take a while...\n")
-		if err := rechunkTree(ctx, srcRepo, dstRepo, visitedTrees, *sn.Tree, gopts.Quiet); err != nil {
+		Verbosef("  copy started, this may take a while...\n")
+		newTreeID, err := rechunkCopyTree(ctx, srcRepo, dstRepo, *sn.Tree, rechunker, gopts.Quiet)
+		if err != nil {
 			return err
 		}
 		debug.Log("tree copied")
@@ -129,20 +132,52 @@ func runRechunk(ctx context.Context, opts RechunkOptions, gopts GlobalOptions, a
 		if sn.Original == nil {
 			sn.Original = sn.ID()
 		}
+		sn.Tree = &newTreeID
 		newID, err := restic.SaveSnapshot(ctx, dstRepo, sn)
 		if err != nil {
 			return err
 		}
 		Verbosef("snapshot %s saved\n", newID.Str())
 	}
-
 	return ctx.Err()
 }
 
-func rechunkTree(ctx context.Context, srcRepo restic.Repository, dstRepo restic.Repository,
-	visitedTrees idMap, rootTreeID restic.ID, quiet bool) error {
+func rechunkCopyTree(ctx context.Context, srcRepo restic.Repository, dstRepo restic.Repository, 
+	rootTreeID restic.ID, rechunker *walker.Rechunker, quiet bool) (restic.ID, error) {
 
-	// refer to and modify rewriter's logic
+	wg, wgCtx := errgroup.WithContext(ctx)
+	dstRepo.StartPackUploader(wgCtx, wg)
 
-	return nil
+	var numFiles uint64
+	walker.Walk(ctx, srcRepo, rootTreeID, walker.WalkVisitor{
+		ProcessNode: func(_ restic.ID, _ string, node *restic.Node, nodeErr error) error {
+			if node == nil {
+				return nil
+			}
+			if nodeErr != nil {
+				return nodeErr
+			}
+			if node.Type == restic.NodeTypeFile {
+				numFiles++
+			}
+			return nil
+		},
+	})
+
+	Verbosef("rechunking %v... ", rootTreeID.Str())
+	if err := rechunker.RechunkData(ctx, rootTreeID); err != nil {
+		return restic.ID{}, err
+	}
+
+	Verbosef("rechunking done. rebuilding the tree... ")
+	newRootID, err := rechunker.RewriteTree(ctx, rootTreeID)
+	if err != nil {
+		return restic.ID{}, err
+	}
+
+	if err := dstRepo.Flush(ctx); err != nil {
+		return restic.ID{}, err
+	}
+
+	return newRootID, nil
 }

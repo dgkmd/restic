@@ -46,13 +46,13 @@ func TestRechunker(t *testing.T) {
 	// prepare test data
 	src := archiver.TestDir{
 		"0": archiver.TestFile{Content: ""},
-		"1": archiver.TestFile{Content: string(rtest.Random(42, 123))},
-		"2": archiver.TestFile{Content: string(rtest.Random(42, 123_456))},
-		"3": archiver.TestFile{Content: string(rtest.Random(42, 1_000_000))},
-		"4": archiver.TestFile{Content: string(rtest.Random(42, 10_000_000))},
-		"5": archiver.TestFile{Content: string(rtest.Random(42, 50_000_000))},
+		"1": archiver.TestFile{Content: string(rtest.Random(11, 123))},
+		"2": archiver.TestFile{Content: string(rtest.Random(12, 123_456))},
+		"3": archiver.TestFile{Content: string(rtest.Random(13, 9_000_000))},
+		"4": archiver.TestFile{Content: string(rtest.Random(14, 10_000_000))},
+		"5": archiver.TestFile{Content: string(rtest.Random(15, 11_000_000))},
 	}
-	dupFileContent := string(rtest.Random(42, 20_000_000))
+	dupFileContent := string(rtest.Random(16, 12_000_000))
 	src["dup1"] = archiver.TestFile{Content: dupFileContent}
 	src["dup2"] = archiver.TestFile{Content: dupFileContent}
 
@@ -86,6 +86,8 @@ func TestRechunker(t *testing.T) {
 			t.Errorf("Blob missing: %v", blobID)
 		}
 	}
+
+	fmt.Println(rechunker.rechunkBlobsMap)
 }
 
 func generateBlobIDsPair(nSrc, nDst uint) BlobIDsPair {
