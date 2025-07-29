@@ -2,6 +2,8 @@ package walker
 
 import (
 	"context"
+	"fmt"
+	"sort"
 	"testing"
 
 	"github.com/restic/chunker"
@@ -11,18 +13,6 @@ import (
 	rtest "github.com/restic/restic/internal/test"
 	"golang.org/x/sync/errgroup"
 )
-
-// TODO: implement two test functions, TestRechunker and TestRewriter.
-
-// TestRechunker:
-// Generate random files ([]byte) of various size (refer to archiver_test.go).
-// Optionally include duplicate files.
-// Chooose two arbitrary chunker polynomials (src and dst).
-// Create test nodes. It suffices to have name, nodeType and content field.
-// At preparation, chunk files by each of the two polynomials.
-// Keep src chunks at mock LoadBlob (srcRepo), put src blob IDs in content fields,
-// and put dst blob IDs in SaveBlob (dstRepo).
-// wants: dstRepo to have all dst blobs computed from dst polynomials.
 
 // TestRewriter:
 // Generate arbitrary tree hierarchy that consists of various node types.
@@ -34,9 +24,8 @@ import (
 // where n: number of src blobs, a~Uniform(0.9, 1.1) and b~Uniform(-2.0, 2.0).
 // And each blob ID should be randomly generated 32 bytes string (SHA256 format).
 
-
 func TestRechunker(t *testing.T) {
-	ctx, cancel := context.WithCancel(context.Background())
+	ctx, cancel := context.WithCancel(context.TODO())
 	defer cancel()
 	repository.TestUseLowSecurityKDFParameters(t)
 
@@ -56,25 +45,30 @@ func TestRechunker(t *testing.T) {
 
 	// prepare test data
 	src := archiver.TestDir{
-		"zero": archiver.TestFile{Content: ""},
-		"tiny": archiver.TestFile{Content: string(rtest.Random(42, 123))},
-		"small": archiver.TestFile{Content: string(rtest.Random(42, 123_456))},
-		"floppy": archiver.TestFile{Content: string(rtest.Random(42, 1_234_567))},
-		"medium": archiver.TestFile{Content: string(rtest.Random(42, 12_345_678))},
-		"large": archiver.TestFile{Content: string(rtest.Random(42, 123_456_789))},
+		"0": archiver.TestFile{Content: ""},
+		"1": archiver.TestFile{Content: string(rtest.Random(42, 123))},
+		"2": archiver.TestFile{Content: string(rtest.Random(42, 123_456))},
+		"3": archiver.TestFile{Content: string(rtest.Random(42, 1_000_000))},
+		"4": archiver.TestFile{Content: string(rtest.Random(42, 10_000_000))},
+		"5": archiver.TestFile{Content: string(rtest.Random(42, 50_000_000))},
 	}
+	dupFileContent := string(rtest.Random(42, 20_000_000))
+	src["dup1"] = archiver.TestFile{Content: dupFileContent}
+	src["dup2"] = archiver.TestFile{Content: dupFileContent}
+
 	tempDir := rtest.TempDir(t)
 	archiver.TestCreateFiles(t, tempDir, src)
 	src = nil
+	dupFileContent = ""
 
 	// archive data to the repos with archiver
 	srcSn := archiver.TestSnapshot(t, srcRepo, tempDir, nil)
 	_ = archiver.TestSnapshot(t, dstWantsRepo, tempDir, nil)
 
-	// do rechunking to dstTestRepo
+	// do rechunking for dstTestRepo
+	rechunker := NewRechunker(srcRepo, dstTestsRepo, dstTestsRepo.Config().ChunkerPolynomial)
 	wg, wgCtx := errgroup.WithContext(ctx)
 	dstTestsRepo.StartPackUploader(wgCtx, wg)
-	rechunker := NewFileRechunker(srcRepo, dstTestsRepo, dstTestsRepo.Config().ChunkerPolynomial)
 	rechunker.RechunkData(ctx, *srcSn.Tree)
 	dstTestsRepo.Flush(ctx)
 
@@ -86,19 +80,201 @@ func TestRechunker(t *testing.T) {
 		}
 	})
 
-	// blobTests := restic.IDs{}
-	// dstTestsRepo.ListBlobs(ctx, func(pb restic.PackedBlob) {
-	// 	if pb.Type == restic.DataBlob {
-	// 		blobTests = append(blobTests, pb.ID)
-	// 	}
-	// })
-	// fmt.Printf("Wanted blobs: %v\n", blobWants.String())
-	// fmt.Printf("Tested blobs: %v\n", blobTests.String())
-
 	for _, blobID := range blobWants {
 		_, ok := dstTestsRepo.LookupBlobSize(restic.DataBlob, blobID)
 		if !ok {
 			t.Errorf("Blob missing: %v", blobID)
 		}
+	}
+}
+
+func generateBlobIDsPair(nSrc, nDst uint) BlobIDsPair {
+	srcIDs := make(restic.IDs, 0, nSrc)
+	dstIDs := make(restic.IDs, 0, nDst)
+	for range nSrc {
+		srcIDs = append(srcIDs, restic.NewRandomID())
+	}
+	for range nDst {
+		dstIDs = append(dstIDs, restic.NewRandomID())
+	}
+
+	return BlobIDsPair{srcBlobIDs: srcIDs, dstBlobIDs: dstIDs}
+}
+
+type TestNodeExtended struct {
+	Type    restic.NodeType
+	Size    uint64
+	Content restic.IDs
+}
+
+func BuildTreeMapExtended(tree TestTree) (m TreeMap, root restic.ID) {
+	m = TreeMap{}
+	id := buildTreeMapExtended(tree, m)
+	return m, id
+}
+
+func buildTreeMapExtended(tree TestTree, m TreeMap) restic.ID {
+	tb := restic.NewTreeJSONBuilder()
+	var names []string
+	for name := range tree {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+
+	for _, name := range names {
+		item := tree[name]
+		switch elem := item.(type) {
+		case TestFile:
+			err := tb.AddNode(&restic.Node{
+				Name: name,
+				Type: restic.NodeTypeFile,
+				Size: elem.Size,
+			})
+			if err != nil {
+				panic(err)
+			}
+		case TestTree:
+			id := buildTreeMapExtended(elem, m)
+			err := tb.AddNode(&restic.Node{
+				Name:    name,
+				Subtree: &id,
+				Type:    restic.NodeTypeDir,
+			})
+			if err != nil {
+				panic(err)
+			}
+		case TestNodeExtended:
+			err := tb.AddNode(&restic.Node{
+				Name:    name,
+				Type:    elem.Type,
+				Size:    elem.Size,
+				Content: elem.Content,
+			})
+			if err != nil {
+				panic(err)
+			}
+		default:
+			panic(fmt.Sprintf("invalid type %T", elem))
+		}
+	}
+
+	buf, err := tb.Finalize()
+	if err != nil {
+		panic(err)
+	}
+
+	id := restic.Hash(buf)
+
+	if _, ok := m[id]; !ok {
+		m[id] = buf
+	}
+
+	return id
+}
+
+func TestRechunkRewriter(t *testing.T) {
+	// test cases preparation:
+	// 1) prepare tree (srcTree, dstWantsTree): Node representation or TestTree representaion (like in walker_test)
+	// 2) prepare blobIDs map: (srcBlobIDs, dstBlobIDs) of random IDs (with restic.ID.NewRandomID())
+	//
+	// test procedure:
+	// 1) convert srcTree and dstWantsTree to node format if not already is
+	// 2) push both tree to repository and get root tree IDs
+	// 3) rewrite srcTree with RewriteTree (-> dstTestsTree)
+	// 4) push dstTestsTree to repository and get root tree ID
+	// 5) ensure root IDs of dstWantsTree and dstTestsTree match
+
+	blobIDsMap := map[string]BlobIDsPair{
+		"a":        generateBlobIDsPair(1, 1),
+		"subdir/a": generateBlobIDsPair(30, 31),
+		"x":        generateBlobIDsPair(42, 41),
+		"0":        generateBlobIDsPair(0, 0),
+	}
+	rechunkBlobsMap := map[hashType]BlobIDsPair{}
+	for _, v := range blobIDsMap {
+		rechunkBlobsMap[hashOfIDs(v.srcBlobIDs)] = v
+	}
+
+	tree := TestTree{
+		"zerofile": TestNodeExtended{
+			Type:    restic.NodeTypeFile,
+			Size:    0,
+			Content: restic.IDs{},
+		},
+		"a": TestNodeExtended{
+			Type:    restic.NodeTypeFile,
+			Size:    1,
+			Content: blobIDsMap["a"].srcBlobIDs,
+		},
+		"subdir": TestTree{
+			"a": TestNodeExtended{
+				Type:    restic.NodeTypeFile,
+				Size:    3,
+				Content: blobIDsMap["subdir/a"].srcBlobIDs,
+			},
+			"x": TestNodeExtended{
+				Type:    restic.NodeTypeFile,
+				Size:    2,
+				Content: blobIDsMap["x"].srcBlobIDs,
+			},
+			"subdir": TestTree{
+				"dup_x": TestNodeExtended{
+					Type:    restic.NodeTypeFile,
+					Size:    2,
+					Content: blobIDsMap["x"].srcBlobIDs,
+				},
+				"nonregularfile": TestNodeExtended{
+					Type: restic.NodeTypeSymlink,
+				},
+			},
+		},
+	}
+	wants := TestTree{
+		"zerofile": TestNodeExtended{
+			Type:    restic.NodeTypeFile,
+			Size:    0,
+			Content: restic.IDs{},
+		},
+		"a": TestNodeExtended{
+			Type:    restic.NodeTypeFile,
+			Size:    1,
+			Content: blobIDsMap["a"].dstBlobIDs,
+		},
+		"subdir": TestTree{
+			"a": TestNodeExtended{
+				Type:    restic.NodeTypeFile,
+				Size:    3,
+				Content: blobIDsMap["subdir/a"].dstBlobIDs,
+			},
+			"x": TestNodeExtended{
+				Type:    restic.NodeTypeFile,
+				Size:    2,
+				Content: blobIDsMap["x"].dstBlobIDs,
+			},
+			"subdir": TestTree{
+				"dup_x": TestNodeExtended{
+					Type:    restic.NodeTypeFile,
+					Size:    2,
+					Content: blobIDsMap["x"].dstBlobIDs,
+				},
+				"nonregularfile": TestNodeExtended{
+					Type: restic.NodeTypeSymlink,
+				},
+			},
+		},
+	}
+
+	srcRepo, srcRoot := BuildTreeMapExtended(tree)
+	_, wantsRoot := BuildTreeMapExtended(wants)
+
+	testsRepo := WritableTreeMap{TreeMap{}}
+	rechunker := NewRechunker(srcRepo, testsRepo, 0)
+	rechunker.rechunkBlobsMap = rechunkBlobsMap
+	testsRoot, err := rechunker.RewriteTree(context.TODO(), srcRoot)
+	if err != nil {
+		t.Error(err)
+	}
+	if wantsRoot != testsRoot {
+		t.Errorf("tree mismatch. wants: %v, tests: %v", wantsRoot, testsRoot)
 	}
 }

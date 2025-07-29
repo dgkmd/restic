@@ -13,39 +13,36 @@ import (
 )
 
 type BlobIDsPair struct {
-	srcBlobIDs    restic.IDs
-	dstBlobIDs    restic.IDs
+	srcBlobIDs restic.IDs
+	dstBlobIDs restic.IDs
 }
 
 type hashType = [32]byte
 
-type FileRechunker struct {
-	// ch chan<-     restic.IDs
-	srcRepo         	restic.BlobLoader
-	dstRepo         	restic.BlobSaver
-	dstRepoPol			chunker.Pol
-	rechunkBlobsMap     map[hashType]BlobIDsPair
-	rewriteTreeMap		map[restic.ID]restic.ID
-	visitedBlobs	  	map[hashType]struct{}
-	// cache     *bloblru.Cache
-	// chnker    *chunker.Chunker
+type Rechunker struct {
+	srcRepo         restic.BlobLoader
+	dstRepo         restic.BlobSaver
+	dstRepoPol      chunker.Pol
+	rechunkBlobsMap map[hashType]BlobIDsPair
+	rewriteTreeMap  map[restic.ID]restic.ID
+	visitedBlobs    map[hashType]struct{}
 }
 
-const blobCacheSize = 64 << 20  // same with fuse.blobCacheSize
+const blobCacheSize = 64 << 20 // same with fuse.blobCacheSize: 64MiB
 
-func NewFileRechunker(srcRepo restic.BlobLoader, dstRepo restic.BlobSaver, dstRepoPol chunker.Pol) *FileRechunker {
-	return &FileRechunker{
-		srcRepo: 			srcRepo,
-		dstRepo: 			dstRepo,
-		dstRepoPol:			dstRepoPol,
-		rechunkBlobsMap: 	make(map[hashType]BlobIDsPair),
-		rewriteTreeMap:     make(map[restic.ID]restic.ID),
-		visitedBlobs:	 	make(map[hashType]struct{}),
+func NewRechunker(srcRepo restic.BlobLoader, dstRepo restic.BlobSaver, dstRepoPol chunker.Pol) *Rechunker {
+	return &Rechunker{
+		srcRepo:         srcRepo,
+		dstRepo:         dstRepo,
+		dstRepoPol:      dstRepoPol,
+		rechunkBlobsMap: make(map[hashType]BlobIDsPair),
+		rewriteTreeMap:  make(map[restic.ID]restic.ID),
+		visitedBlobs:    make(map[hashType]struct{}),
 	}
 }
 
-func (rc *FileRechunker) RechunkData(ctx context.Context, root restic.ID) error {
-	numWorkers := 2  // TODO: make it configurable
+func (rc *Rechunker) RechunkData(ctx context.Context, root restic.ID) error {
+	numWorkers := 2 // TODO: make it configurable
 	chFile := make(chan restic.IDs, numWorkers)
 	visitor := WalkVisitor{
 		ProcessNode: func(_ restic.ID, _ string, node *restic.Node, nodeErr error) error {
@@ -58,7 +55,7 @@ func (rc *FileRechunker) RechunkData(ctx context.Context, root restic.ID) error 
 				return nil
 			}
 
-			// skip if identical file content is already registered
+			// skip if identical file content has already been visited
 			hashval := hashOfIDs(node.Content)
 			if _, ok := rc.visitedBlobs[hashval]; ok {
 				return nil
@@ -81,22 +78,22 @@ func (rc *FileRechunker) RechunkData(ctx context.Context, root restic.ID) error 
 		wgUp.Go(func() error {
 			chnker := chunker.New(nil, rc.dstRepoPol)
 			chReuseBuf := make(chan []byte, 1)
-			
+
 			for {
-				wg, wgCtx := errgroup.WithContext(wgUpCtx)
 				var srcBlobs restic.IDs
 				var ok bool
 				select {
-				case <-wgUpCtx.Done():  // context cancelled
+				case <-wgUpCtx.Done():
 					return wgUpCtx.Err()
 				case srcBlobs, ok = <-chFile:
-					if !ok {  // chan closed and drained
+					if !ok { // all files visited and chan closed
 						return nil
 					}
 				}
 				dstBlobs := restic.IDs{}
-				
-				// run downloader/iopipe/chunker/uploader goroutine
+				wg, wgCtx := errgroup.WithContext(wgUpCtx)
+
+				// run downloader/iopipe/chunker/uploader Goroutines per each file
 				// downloader
 				chDownload := make(chan []byte)
 				wg.Go(func() error {
@@ -104,7 +101,6 @@ func (rc *FileRechunker) RechunkData(ctx context.Context, root restic.ID) error 
 						buf, err := blobCache.GetOrCompute(blobID, func() ([]byte, error) {
 							return rc.srcRepo.LoadBlob(wgCtx, restic.DataBlob, blobID, nil)
 						})
-						// buf, err := rc.srcRepo.LoadBlob(wgCtx, restic.DataBlob, blobID, nil)
 						if err != nil {
 							return err
 						}
@@ -115,12 +111,11 @@ func (rc *FileRechunker) RechunkData(ctx context.Context, root restic.ID) error 
 						case chDownload <- buf:
 						}
 					}
-					
 					close(chDownload)
 					return nil
 				})
 
-				// iopipe
+				// iopipe: convert chunks into io.Reader stream
 				r, w := io.Pipe()
 				wg.Go(func() error {
 					for {
@@ -128,9 +123,10 @@ func (rc *FileRechunker) RechunkData(ctx context.Context, root restic.ID) error 
 						var ok bool
 						select {
 						case <-wgCtx.Done():
+							w.CloseWithError(wgCtx.Err())
 							return wgCtx.Err()
 						case buf, ok = <-chDownload:
-							if !ok {  // EOF
+							if !ok { // EOF
 								w.Close()
 								return nil
 							}
@@ -138,11 +134,12 @@ func (rc *FileRechunker) RechunkData(ctx context.Context, root restic.ID) error 
 
 						_, err := w.Write(buf)
 						if err != nil {
+							w.CloseWithError(err)
 							return err
 						}
 					}
 				})
-				
+
 				// chunker
 				chnker.Reset(r, rc.dstRepoPol)
 				chUpload := make(chan []byte)
@@ -161,11 +158,13 @@ func (rc *FileRechunker) RechunkData(ctx context.Context, root restic.ID) error 
 							return nil
 						}
 						if err != nil {
+							r.CloseWithError(err)
 							return err
 						}
 
 						select {
 						case <-wgCtx.Done():
+							r.CloseWithError(wgCtx.Err())
 							return wgCtx.Err()
 						case chUpload <- chunk.Data:
 						}
@@ -181,7 +180,7 @@ func (rc *FileRechunker) RechunkData(ctx context.Context, root restic.ID) error 
 						case <-wgCtx.Done():
 							return wgCtx.Err()
 						case blobData, ok = <-chUpload:
-							if !ok {  // EOF
+							if !ok { // EOF
 								return nil
 							}
 						}
@@ -219,24 +218,26 @@ func (rc *FileRechunker) RechunkData(ctx context.Context, root restic.ID) error 
 	if err != nil {
 		return err
 	}
+
+	// wait for rechunk jobs to finish
 	return wgUp.Wait()
 }
 
-func (rc *FileRechunker) rewriteNode(node *restic.Node) error {
+func (rc *Rechunker) rewriteNode(node *restic.Node) error {
 	if node.Type != restic.NodeTypeFile {
 		return nil
 	}
 
 	hashval := hashOfIDs(node.Content)
 	blobsPair, ok := rc.rechunkBlobsMap[hashval]
-	if !ok {  // critical bug!
-		return fmt.Errorf("Can't find from rechunkBlobsMap: %v", hashval)
+	if !ok {
+		return fmt.Errorf("can't find from rechunkBlobsMap: %v", node.Content.String())
 	}
 	node.Content = blobsPair.dstBlobIDs
 	return nil
 }
 
-func (rc *FileRechunker) RewriteTree(ctx context.Context, nodeID restic.ID) (newNodeID restic.ID, err error) {
+func (rc *Rechunker) RewriteTree(ctx context.Context, nodeID restic.ID) (restic.ID, error) {
 	// check if the identical tree has already been processed
 	newID, ok := rc.rewriteTreeMap[nodeID]
 	if ok {
@@ -266,11 +267,8 @@ func (rc *FileRechunker) RewriteTree(ctx context.Context, nodeID restic.ID) (new
 			}
 			continue
 		}
-		// treat nil as null id
-		var subtree restic.ID
-		if node.Subtree != nil {
-			subtree = *node.Subtree
-		}
+
+		subtree := *node.Subtree
 		newID, err := rc.RewriteTree(ctx, subtree)
 		if err != nil {
 			return restic.ID{}, err
@@ -294,8 +292,8 @@ func (rc *FileRechunker) RewriteTree(ctx context.Context, nodeID restic.ID) (new
 }
 
 func hashOfIDs(ids restic.IDs) hashType {
-	c := make([]byte, 0, len(ids) * 32)
-	for _, id := range(ids) {
+	c := make([]byte, 0, len(ids)*32)
+	for _, id := range ids {
 		c = append(c, id[:]...)
 	}
 	return sha256.Sum256(c)
