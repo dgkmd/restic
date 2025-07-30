@@ -9,6 +9,7 @@ import (
 	"github.com/restic/chunker"
 	"github.com/restic/restic/internal/bloblru"
 	"github.com/restic/restic/internal/restic"
+	"github.com/restic/restic/internal/ui/progress"
 	"golang.org/x/sync/errgroup"
 )
 
@@ -41,7 +42,7 @@ func NewRechunker(srcRepo restic.BlobLoader, dstRepo restic.BlobSaver, dstRepoPo
 	}
 }
 
-func (rc *Rechunker) RechunkData(ctx context.Context, root restic.ID) error {
+func (rc *Rechunker) RechunkData(ctx context.Context, root restic.ID, p *progress.Counter) error {
 	numWorkers := 2 // TODO: make it configurable
 	chFile := make(chan restic.IDs, numWorkers)
 	visitor := WalkVisitor{
@@ -58,6 +59,7 @@ func (rc *Rechunker) RechunkData(ctx context.Context, root restic.ID) error {
 			// skip if identical file content has already been visited
 			hashval := hashOfIDs(node.Content)
 			if _, ok := rc.visitedBlobs[hashval]; ok {
+				if p != nil {p.Add(1)}
 				return nil
 			}
 			rc.visitedBlobs[hashval] = struct{}{}
@@ -77,7 +79,7 @@ func (rc *Rechunker) RechunkData(ctx context.Context, root restic.ID) error {
 	for range numWorkers {
 		wgUp.Go(func() error {
 			chnker := chunker.New(nil, rc.dstRepoPol)
-			chReuseBuf := make(chan []byte, 1)
+			bufferPool := make(chan []byte, 1)
 
 			for {
 				var srcBlobs restic.IDs
@@ -147,7 +149,7 @@ func (rc *Rechunker) RechunkData(ctx context.Context, root restic.ID) error {
 					for {
 						var buf []byte
 						select {
-						case buf = <-chReuseBuf:
+						case buf = <-bufferPool:
 						default:
 							buf = make([]byte, chunker.MaxSize)
 						}
@@ -191,7 +193,7 @@ func (rc *Rechunker) RechunkData(ctx context.Context, root restic.ID) error {
 						}
 
 						select {
-						case chReuseBuf <- blobData:
+						case bufferPool <- blobData:
 						default:
 						}
 						dstBlobs = append(dstBlobs, blobID)
@@ -208,6 +210,8 @@ func (rc *Rechunker) RechunkData(ctx context.Context, root restic.ID) error {
 					srcBlobIDs: srcBlobs,
 					dstBlobIDs: dstBlobs,
 				}
+
+				if p != nil {p.Add(1)}
 			}
 		})
 	}

@@ -151,11 +151,11 @@ func rechunkCopyTree(ctx context.Context, srcRepo restic.Repository, dstRepo res
 	var numFiles uint64
 	walker.Walk(ctx, srcRepo, rootTreeID, walker.WalkVisitor{
 		ProcessNode: func(_ restic.ID, _ string, node *restic.Node, nodeErr error) error {
-			if node == nil {
-				return nil
-			}
 			if nodeErr != nil {
 				return nodeErr
+			}
+			if node == nil {
+				return nil
 			}
 			if node.Type == restic.NodeTypeFile {
 				numFiles++
@@ -164,10 +164,11 @@ func rechunkCopyTree(ctx context.Context, srcRepo restic.Repository, dstRepo res
 		},
 	})
 
-	Verbosef("rechunking %v... ", rootTreeID.Str())
-	if err := rechunker.RechunkData(ctx, rootTreeID); err != nil {
+	bar := newProgressMax(!quiet, numFiles, "files copied")
+	if err := rechunker.RechunkData(ctx, rootTreeID, bar); err != nil {
 		return restic.ID{}, err
 	}
+	bar.Done()
 
 	Verbosef("rechunking done. rebuilding the tree... ")
 	newRootID, err := rechunker.RewriteTree(ctx, rootTreeID)
