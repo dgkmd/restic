@@ -42,7 +42,7 @@ func NewRechunker(srcRepo restic.BlobLoader, dstRepo restic.BlobSaver, dstRepoPo
 }
 
 func (rc *Rechunker) RechunkData(ctx context.Context, root restic.ID, p *progress.Counter) error {
-	numWorkers := 2 // TODO: make it configurable
+	numWorkers := 1 // TODO: make it configurable
 	chFile := make(chan restic.IDs, numWorkers)
 	visitor := WalkVisitor{
 		ProcessNode: func(_ restic.ID, _ string, node *restic.Node, nodeErr error) error {

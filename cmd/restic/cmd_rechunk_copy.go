@@ -169,7 +169,7 @@ func rechunkCopyTree(ctx context.Context, srcRepo restic.Repository, dstRepo res
 		},
 	})
 
-	bar := newProgressMax(!quiet, numFiles, "files copied")
+	bar := newProgressMax(!quiet, numFiles, "files rechunked")
 	if err := rechunker.RechunkData(ctx, rootTreeID, bar); err != nil {
 		return restic.ID{}, err
 	}
