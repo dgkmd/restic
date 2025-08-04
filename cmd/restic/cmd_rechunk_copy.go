@@ -33,11 +33,13 @@ func newRechunkCopyCommand() *cobra.Command {
 type RechunkCopyOptions struct {
 	secondaryRepoOptions
 	restic.SnapshotFilter
+	RechunkTags restic.TagLists
 }
 
 func (opts *RechunkCopyOptions) AddFlags(f *pflag.FlagSet) {
 	opts.secondaryRepoOptions.AddFlags(f, "destination", "to copy snapshots from")
 	initMultiSnapshotFilter(f, &opts.SnapshotFilter, true)
+	f.Var(&opts.RechunkTags, "rechunk-tag", "add `tags` for the rechunked snapshots in the format `tag[,tag,...]` (can be specified multiple times)")
 }
 
 func runRechunkCopy(ctx context.Context, opts RechunkCopyOptions, gopts GlobalOptions, args []string) error {
@@ -132,7 +134,10 @@ func runRechunkCopy(ctx context.Context, opts RechunkCopyOptions, gopts GlobalOp
 		if sn.Original == nil {
 			sn.Original = sn.ID()
 		}
+		// change Tree field to new one
 		sn.Tree = &newTreeID
+		// add tags if provided
+		sn.AddTags(opts.RechunkTags.Flatten())
 		newID, err := restic.SaveSnapshot(ctx, dstRepo, sn)
 		if err != nil {
 			return err

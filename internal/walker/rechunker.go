@@ -5,9 +5,9 @@ import (
 	"crypto/sha256"
 	"fmt"
 	"io"
+	"sync"
 
 	"github.com/restic/chunker"
-	"github.com/restic/restic/internal/bloblru"
 	"github.com/restic/restic/internal/restic"
 	"github.com/restic/restic/internal/ui/progress"
 	"golang.org/x/sync/errgroup"
@@ -24,19 +24,18 @@ type Rechunker struct {
 	srcRepo         restic.BlobLoader
 	dstRepo         restic.BlobSaver
 	dstRepoPol      chunker.Pol
-	rechunkBlobsMap map[hashType]BlobIDsPair
+	rechunkBlobsMap map[hashType]restic.IDs
+	rechunkBlobsMapLock sync.Mutex
 	rewriteTreeMap  map[restic.ID]restic.ID
 	visitedBlobs    map[hashType]struct{}
 }
-
-const blobCacheSize = 64 << 20 // same with fuse.blobCacheSize: 64MiB
 
 func NewRechunker(srcRepo restic.BlobLoader, dstRepo restic.BlobSaver, dstRepoPol chunker.Pol) *Rechunker {
 	return &Rechunker{
 		srcRepo:         srcRepo,
 		dstRepo:         dstRepo,
 		dstRepoPol:      dstRepoPol,
-		rechunkBlobsMap: make(map[hashType]BlobIDsPair),
+		rechunkBlobsMap: make(map[hashType]restic.IDs),
 		rewriteTreeMap:  make(map[restic.ID]restic.ID),
 		visitedBlobs:    make(map[hashType]struct{}),
 	}
@@ -72,14 +71,13 @@ func (rc *Rechunker) RechunkData(ctx context.Context, root restic.ID, p *progres
 			return nil
 		},
 	}
-	blobCache := bloblru.New(blobCacheSize)
 
 	// create rechunk workers
 	wgUp, wgUpCtx := errgroup.WithContext(ctx)
 	for range numWorkers {
 		wgUp.Go(func() error {
 			chnker := chunker.New(nil, rc.dstRepoPol)
-			bufferPool := make(chan []byte, 1)
+			bufferPool := make(chan []byte, 2)
 
 			for {
 				var srcBlobs restic.IDs
@@ -100,9 +98,13 @@ func (rc *Rechunker) RechunkData(ctx context.Context, root restic.ID, p *progres
 				chDownload := make(chan []byte)
 				wg.Go(func() error {
 					for _, blobID := range srcBlobs {
-						buf, err := blobCache.GetOrCompute(blobID, func() ([]byte, error) {
-							return rc.srcRepo.LoadBlob(wgCtx, restic.DataBlob, blobID, nil)
-						})
+						var buf []byte
+						select {
+						case buf = <-bufferPool:
+						default:
+							buf = make([]byte, chunker.MaxSize)
+						}
+						buf, err := rc.srcRepo.LoadBlob(wgCtx, restic.DataBlob, blobID, buf)
 						if err != nil {
 							return err
 						}
@@ -138,6 +140,10 @@ func (rc *Rechunker) RechunkData(ctx context.Context, root restic.ID, p *progres
 						if err != nil {
 							w.CloseWithError(err)
 							return err
+						}
+						select {
+						case bufferPool <- buf:
+						default:
 						}
 					}
 				})
@@ -206,10 +212,9 @@ func (rc *Rechunker) RechunkData(ctx context.Context, root restic.ID, p *progres
 				}
 
 				// register to rechunkMap
-				rc.rechunkBlobsMap[hashOfIDs(srcBlobs)] = BlobIDsPair{
-					srcBlobIDs: srcBlobs,
-					dstBlobIDs: dstBlobs,
-				}
+				rc.rechunkBlobsMapLock.Lock()
+				rc.rechunkBlobsMap[hashOfIDs(srcBlobs)] = dstBlobs
+				rc.rechunkBlobsMapLock.Unlock()
 
 				if p != nil {p.Add(1)}
 			}
@@ -233,11 +238,11 @@ func (rc *Rechunker) rewriteNode(node *restic.Node) error {
 	}
 
 	hashval := hashOfIDs(node.Content)
-	blobsPair, ok := rc.rechunkBlobsMap[hashval]
+	dstBlobs, ok := rc.rechunkBlobsMap[hashval]
 	if !ok {
 		return fmt.Errorf("can't find from rechunkBlobsMap: %v", node.Content.String())
 	}
-	node.Content = blobsPair.dstBlobIDs
+	node.Content = dstBlobs
 	return nil
 }
 
