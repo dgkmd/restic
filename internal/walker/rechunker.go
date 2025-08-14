@@ -13,11 +13,6 @@ import (
 	"golang.org/x/sync/errgroup"
 )
 
-type BlobIDsPair struct {
-	srcBlobIDs restic.IDs
-	dstBlobIDs restic.IDs
-}
-
 type hashType = [32]byte
 
 type Rechunker struct {
