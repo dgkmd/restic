@@ -86,6 +86,7 @@ The full documentation can be found at https://restic.readthedocs.io/ .
 		newOptionsCommand(),
 		newPruneCommand(),
 		newRebuildIndexCommand(),
+		newRechunkCopyCommand(),
 		newRecoverCommand(),
 		newRepairCommand(),
 		newRestoreCommand(),
@@ -95,7 +96,6 @@ The full documentation can be found at https://restic.readthedocs.io/ .
 		newTagCommand(),
 		newUnlockCommand(),
 		newVersionCommand(),
-		newRechunkCopyCommand(),
 	)
 
 	registerDebugCommand(cmd)
