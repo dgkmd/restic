@@ -1,5 +1,3 @@
-// plan: open repos ->
-
 package main
 
 import (
@@ -8,16 +6,40 @@ import (
 	"github.com/restic/restic/internal/debug"
 	"github.com/restic/restic/internal/restic"
 	"github.com/restic/restic/internal/walker"
+	"github.com/restic/restic/internal/feature"
+	"github.com/restic/restic/internal/errors"
 	"golang.org/x/sync/errgroup"
 
 	"github.com/spf13/cobra"
 	"github.com/spf13/pflag"
 )
 
+// Reference: cmd_copy.go (v0.18.0)
+
 func newRechunkCopyCommand() *cobra.Command {
 	var opts RechunkCopyOptions
 	cmd := &cobra.Command{
-		Use:               "rechunk-copy [flags] [snapshotID ...]",
+		Use:   "rechunk-copy [flags] [snapshotID ...]",
+		Short: "Rechunk-copy snapshots from one repository to another",
+		Long: `
+The "rechunk-copy" command rechunk-copies one or more snapshots from one repository to another.
+
+Data blobs stored in the destination repo are rechunked, and tree blobs in the destination repo are also updated accordingly.
+
+NOTE: This command has largely different internal mechanism from "copy" command,
+due to restic's content defined chunking (CDC) design. Note that "rechunk-copy"
+may consume significantly more bandwidth during the process compared to "copy", 
+and may also need significantly more time to finish.
+
+EXIT STATUS
+===========
+
+Exit status is 0 if the command was successful.
+Exit status is 1 if there was any error.
+Exit status is 10 if the repository does not exist.
+Exit status is 11 if the repository is already locked.
+Exit status is 12 if the password is incorrect.
+		`,
 		GroupID:           cmdGroupDefault,
 		DisableAutoGenTag: true,
 		RunE: func(cmd *cobra.Command, args []string) error {
@@ -29,7 +51,7 @@ func newRechunkCopyCommand() *cobra.Command {
 	return cmd
 }
 
-// RechunkCopyOptions bundles all options for the copy command.
+// RechunkCopyOptions bundles all options for the rechunk-copy command.
 type RechunkCopyOptions struct {
 	secondaryRepoOptions
 	restic.SnapshotFilter
@@ -39,10 +61,14 @@ type RechunkCopyOptions struct {
 func (opts *RechunkCopyOptions) AddFlags(f *pflag.FlagSet) {
 	opts.secondaryRepoOptions.AddFlags(f, "destination", "to copy snapshots from")
 	initMultiSnapshotFilter(f, &opts.SnapshotFilter, true)
-	f.Var(&opts.RechunkTags, "rechunk-tag", "add `tags` for the rechunked snapshots in the format `tag[,tag,...]` (can be specified multiple times)")
+	f.Var(&opts.RechunkTags, "rechunk-tag", "add `tags` for the copied snapshots in the format `tag[,tag,...]` (can be specified multiple times)")
 }
 
 func runRechunkCopy(ctx context.Context, opts RechunkCopyOptions, gopts GlobalOptions, args []string) error {
+	if !feature.Flag.Enabled(feature.RechunkCopy) {
+		return errors.Fatal("rechunk-copy feature flag is not set. Currently, rechunk-copy is alpha feature (disabled by default).")
+	}
+
 	secondaryGopts, isFromRepo, err := fillSecondaryGlobalOpts(ctx, opts.secondaryRepoOptions, gopts, "destination")
 	if err != nil {
 		return err

@@ -5,14 +5,19 @@ import (
 	"fmt"
 	"sort"
 	"testing"
+	"golang.org/x/sync/errgroup"
 
 	"github.com/restic/chunker"
-	"github.com/restic/restic/internal/archiver"
-	"github.com/restic/restic/internal/repository"
+
 	"github.com/restic/restic/internal/restic"
 	rtest "github.com/restic/restic/internal/test"
-	"golang.org/x/sync/errgroup"
+
+	// borrowing test fixtures from following packages
+	"github.com/restic/restic/internal/archiver"  
+	"github.com/restic/restic/internal/repository"
 )
+
+// Reference: walker_test.go, rewriter_test.go (v0.18.0)
 
 func TestRechunkerRechunkData(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.TODO())
@@ -165,17 +170,6 @@ func buildTreeMapExtended(tree TestTree, m TreeMap) restic.ID {
 }
 
 func TestRechunkerRewriteTree(t *testing.T) {
-	// test cases preparation:
-	// 1) prepare tree (srcTree, dstWantsTree): Node representation or TestTree representaion (like in walker_test)
-	// 2) prepare blobIDs map: (srcBlobIDs, dstBlobIDs) of random IDs (with restic.ID.NewRandomID())
-	//
-	// test procedure:
-	// 1) convert srcTree and dstWantsTree to node format if not already is
-	// 2) push both tree to repository and get root tree IDs
-	// 3) rewrite srcTree with RewriteTree (-> dstTestsTree)
-	// 4) push dstTestsTree to repository and get root tree ID
-	// 5) ensure root IDs of dstWantsTree and dstTestsTree match
-
 	blobIDsMap := map[string]BlobIDsPair{
 		"a":        generateBlobIDsPair(1, 1),
 		"subdir/a": generateBlobIDsPair(30, 31),
