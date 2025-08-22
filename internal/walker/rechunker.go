@@ -17,13 +17,13 @@ import (
 type hashType = [32]byte
 
 type Rechunker struct {
-	srcRepo         restic.BlobLoader
-	dstRepo         restic.BlobSaver
-	dstRepoPol      chunker.Pol
-	rechunkBlobsMap map[hashType]restic.IDs
+	srcRepo             restic.BlobLoader
+	dstRepo             restic.BlobSaver
+	dstRepoPol          chunker.Pol
+	rechunkBlobsMap     map[hashType]restic.IDs
 	rechunkBlobsMapLock sync.Mutex
-	rewriteTreeMap  map[restic.ID]restic.ID
-	visitedBlobs    map[hashType]struct{}
+	rewriteTreeMap      map[restic.ID]restic.ID
+	visitedBlobs        map[hashType]struct{}
 }
 
 func NewRechunker(srcRepo restic.BlobLoader, dstRepo restic.BlobSaver, dstRepoPol chunker.Pol) *Rechunker {
@@ -54,7 +54,9 @@ func (rc *Rechunker) RechunkData(ctx context.Context, root restic.ID, p *progres
 			// skip if identical file content has already been visited
 			hashval := hashOfIDs(node.Content)
 			if _, ok := rc.visitedBlobs[hashval]; ok {
-				if p != nil {p.Add(1)}
+				if p != nil {
+					p.Add(1)
+				}
 				return nil
 			}
 			rc.visitedBlobs[hashval] = struct{}{}
@@ -142,7 +144,7 @@ func (rc *Rechunker) RechunkData(ctx context.Context, root restic.ID, p *progres
 						default:
 						}
 					}
-					
+
 				})
 
 				// chunker: rechunk filestream with destination repo's chunking parameter
@@ -217,7 +219,9 @@ func (rc *Rechunker) RechunkData(ctx context.Context, root restic.ID, p *progres
 				rc.rechunkBlobsMap[hashOfIDs(srcBlobs)] = dstBlobs
 				rc.rechunkBlobsMapLock.Unlock()
 
-				if p != nil {p.Add(1)}
+				if p != nil {
+					p.Add(1)
+				}
 			}
 		})
 	}

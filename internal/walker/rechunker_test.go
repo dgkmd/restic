@@ -3,9 +3,9 @@ package walker
 import (
 	"context"
 	"fmt"
+	"golang.org/x/sync/errgroup"
 	"sort"
 	"testing"
-	"golang.org/x/sync/errgroup"
 
 	"github.com/restic/chunker"
 
@@ -13,7 +13,7 @@ import (
 	rtest "github.com/restic/restic/internal/test"
 
 	// borrowing test fixtures from following packages
-	"github.com/restic/restic/internal/archiver"  
+	"github.com/restic/restic/internal/archiver"
 	"github.com/restic/restic/internal/repository"
 )
 

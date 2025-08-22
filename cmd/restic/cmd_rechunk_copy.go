@@ -4,10 +4,10 @@ import (
 	"context"
 
 	"github.com/restic/restic/internal/debug"
+	"github.com/restic/restic/internal/errors"
+	"github.com/restic/restic/internal/feature"
 	"github.com/restic/restic/internal/restic"
 	"github.com/restic/restic/internal/walker"
-	"github.com/restic/restic/internal/feature"
-	"github.com/restic/restic/internal/errors"
 	"golang.org/x/sync/errgroup"
 
 	"github.com/spf13/cobra"
@@ -173,7 +173,7 @@ func runRechunkCopy(ctx context.Context, opts RechunkCopyOptions, gopts GlobalOp
 	return ctx.Err()
 }
 
-func rechunkCopyTree(ctx context.Context, srcRepo restic.Repository, dstRepo restic.Repository, 
+func rechunkCopyTree(ctx context.Context, srcRepo restic.Repository, dstRepo restic.Repository,
 	rootTreeID restic.ID, rechunker *walker.Rechunker, quiet bool) (restic.ID, error) {
 
 	wg, wgCtx := errgroup.WithContext(ctx)
