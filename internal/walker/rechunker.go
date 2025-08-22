@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"fmt"
 	"io"
+	"runtime"
 	"sync"
 
 	"github.com/restic/chunker"
@@ -37,7 +38,7 @@ func NewRechunker(srcRepo restic.BlobLoader, dstRepo restic.BlobSaver, dstRepoPo
 }
 
 func (rc *Rechunker) RechunkData(ctx context.Context, root restic.ID, p *progress.Counter) error {
-	numWorkers := 1 // TODO: make it configurable
+	numWorkers := runtime.GOMAXPROCS(0)
 	chFile := make(chan restic.IDs, numWorkers)
 	visitor := WalkVisitor{
 		ProcessNode: func(_ restic.ID, _ string, node *restic.Node, nodeErr error) error {
@@ -89,7 +90,7 @@ func (rc *Rechunker) RechunkData(ctx context.Context, root restic.ID, p *progres
 				wg, wgCtx := errgroup.WithContext(wgUpCtx)
 
 				// run downloader/iopipe/chunker/uploader Goroutines per each file
-				// downloader
+				// downloader: load original chunks one by one from source repo
 				chDownload := make(chan []byte)
 				wg.Go(func() error {
 					for _, blobID := range srcBlobs {
@@ -141,9 +142,10 @@ func (rc *Rechunker) RechunkData(ctx context.Context, root restic.ID, p *progres
 						default:
 						}
 					}
+					
 				})
 
-				// chunker
+				// chunker: rechunk filestream with destination repo's chunking parameter
 				chnker.Reset(r, rc.dstRepoPol)
 				chUpload := make(chan []byte)
 				wg.Go(func() error {
@@ -157,6 +159,10 @@ func (rc *Rechunker) RechunkData(ctx context.Context, root restic.ID, p *progres
 
 						chunk, err := chnker.Next(buf)
 						if err == io.EOF {
+							select {
+							case bufferPool <- buf:
+							default:
+							}
 							close(chUpload)
 							return nil
 						}
@@ -174,7 +180,7 @@ func (rc *Rechunker) RechunkData(ctx context.Context, root restic.ID, p *progres
 					}
 				})
 
-				// uploader
+				// uploader: save rechunked blobs into destination repo
 				wg.Go(func() error {
 					for {
 						var blobData []byte
