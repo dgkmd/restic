@@ -17,6 +17,8 @@ import (
 
 type hashType = [32]byte
 
+// need blobCache struct for caching blobs from downloaded packs...?
+
 type Rechunker struct {
 	srcRepo             restic.BlobLoader
 	dstRepo             restic.BlobSaver
@@ -25,6 +27,8 @@ type Rechunker struct {
 	rechunkBlobsMapLock sync.Mutex
 	rewriteTreeMap      map[restic.ID]restic.ID
 	visitedBlobs        map[hashType]struct{}
+	requiredBlob        map[restic.ID]uint
+	srcBlobsList        []restic.IDs
 }
 
 func NewRechunker(srcRepo restic.BlobLoader, dstRepo restic.BlobSaver, dstRepoPol chunker.Pol) *Rechunker {
@@ -35,15 +39,21 @@ func NewRechunker(srcRepo restic.BlobLoader, dstRepo restic.BlobSaver, dstRepoPo
 		rechunkBlobsMap: make(map[hashType]restic.IDs),
 		rewriteTreeMap:  make(map[restic.ID]restic.ID),
 		visitedBlobs:    make(map[hashType]struct{}),
+		requiredBlob:    make(map[restic.ID]uint),
+		srcBlobsList:    make([]restic.IDs, 0),
 	}
 }
 
 func (rc *Rechunker) RechunkData(ctx context.Context, root restic.ID, p *progress.Counter) error {
 	numWorkers := runtime.GOMAXPROCS(0)
-	chFile := make(chan restic.IDs, numWorkers)
 	bufferPool := make(chan []byte, 4*numWorkers)
 	visitor := WalkVisitor{
-		ProcessNode: func(_ restic.ID, _ string, node *restic.Node, nodeErr error) error {
+		ProcessNode: func(id restic.ID, _ string, node *restic.Node, _ error) error {
+			// skip the tree if already processed
+			if _, ok := rc.rewriteTreeMap[id]; ok {
+				return ErrSkipNode
+			}
+
 			// skip root node (node == nil)
 			if node == nil {
 				return nil
@@ -63,13 +73,15 @@ func (rc *Rechunker) RechunkData(ctx context.Context, root restic.ID, p *progres
 			}
 			rc.visitedBlobs[hashval] = struct{}{}
 
-			select {
-			case chFile <- node.Content:
-			case <-ctx.Done():
-				return ctx.Err()
-			}
+			rc.srcBlobsList = append(rc.srcBlobsList, node.Content)
 			return nil
 		},
+	}
+
+	// gather file `Content`s from snapshot
+	err := Walk(ctx, rc.srcRepo, root, visitor)
+	if err != nil {
+		return err
 	}
 
 	// create rechunk workers
@@ -218,8 +230,9 @@ func (rc *Rechunker) RechunkData(ctx context.Context, root restic.ID, p *progres
 				}
 
 				// register to rechunkMap
+				hashval := hashOfIDs(srcBlobs)
 				rc.rechunkBlobsMapLock.Lock()
-				rc.rechunkBlobsMap[hashOfIDs(srcBlobs)] = dstBlobs
+				rc.rechunkBlobsMap[hashval] = dstBlobs
 				rc.rechunkBlobsMapLock.Unlock()
 
 				if p != nil {
@@ -227,13 +240,6 @@ func (rc *Rechunker) RechunkData(ctx context.Context, root restic.ID, p *progres
 				}
 			}
 		})
-	}
-
-	// call Walk(): register jobs to ch
-	err := Walk(ctx, rc.srcRepo, root, visitor)
-	close(chFile)
-	if err != nil {
-		return err
 	}
 
 	// wait for rechunk jobs to finish
