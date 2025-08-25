@@ -9,6 +9,7 @@ import (
 	"sync"
 
 	"github.com/restic/chunker"
+	"github.com/restic/restic/internal/debug"
 	"github.com/restic/restic/internal/restic"
 	"github.com/restic/restic/internal/ui/progress"
 	"golang.org/x/sync/errgroup"
@@ -40,6 +41,7 @@ func NewRechunker(srcRepo restic.BlobLoader, dstRepo restic.BlobSaver, dstRepoPo
 func (rc *Rechunker) RechunkData(ctx context.Context, root restic.ID, p *progress.Counter) error {
 	numWorkers := runtime.GOMAXPROCS(0)
 	chFile := make(chan restic.IDs, numWorkers)
+	bufferPool := make(chan []byte, 4*numWorkers)
 	visitor := WalkVisitor{
 		ProcessNode: func(_ restic.ID, _ string, node *restic.Node, nodeErr error) error {
 			// skip root node (node == nil)
@@ -75,7 +77,6 @@ func (rc *Rechunker) RechunkData(ctx context.Context, root restic.ID, p *progres
 	for range numWorkers {
 		wgUp.Go(func() error {
 			chnker := chunker.New(nil, rc.dstRepoPol)
-			bufferPool := make(chan []byte, 2)
 
 			for {
 				var srcBlobs restic.IDs
@@ -100,6 +101,7 @@ func (rc *Rechunker) RechunkData(ctx context.Context, root restic.ID, p *progres
 						select {
 						case buf = <-bufferPool:
 						default:
+							debug.Log("make buffer (1)")
 							buf = make([]byte, chunker.MaxSize)
 						}
 						buf, err := rc.srcRepo.LoadBlob(wgCtx, restic.DataBlob, blobID, buf)
@@ -156,6 +158,7 @@ func (rc *Rechunker) RechunkData(ctx context.Context, root restic.ID, p *progres
 						select {
 						case buf = <-bufferPool:
 						default:
+							debug.Log("make buffer (2)")
 							buf = make([]byte, chunker.MaxSize)
 						}
 
