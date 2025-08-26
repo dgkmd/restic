@@ -3,9 +3,10 @@ package walker
 import (
 	"context"
 	"fmt"
-	"golang.org/x/sync/errgroup"
 	"sort"
 	"testing"
+
+	"golang.org/x/sync/errgroup"
 
 	"github.com/restic/chunker"
 
@@ -255,7 +256,7 @@ func TestRechunkerRewriteTree(t *testing.T) {
 
 	testsRepo := WritableTreeMap{TreeMap{}}
 	rechunker := NewRechunker(srcRepo, testsRepo, 0)
-	rechunker.rechunkBlobsMap = rechunkBlobsMap
+	rechunker.rechunkMap = rechunkBlobsMap
 	testsRoot, err := rechunker.RewriteTree(context.TODO(), srcRoot)
 	if err != nil {
 		t.Error(err)

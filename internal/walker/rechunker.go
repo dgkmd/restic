@@ -20,69 +20,92 @@ type hashType = [32]byte
 // need blobCache struct for caching blobs from downloaded packs...?
 
 type Rechunker struct {
-	srcRepo             restic.BlobLoader
+	srcRepo             restic.Repository
 	dstRepo             restic.BlobSaver
 	dstRepoPol          chunker.Pol
-	rechunkBlobsMap     map[hashType]restic.IDs
-	rechunkBlobsMapLock sync.Mutex
+	rechunkMap          map[hashType]restic.IDs
+	rechunkMapLock sync.Mutex
 	rewriteTreeMap      map[restic.ID]restic.ID
-	visitedBlobs        map[hashType]struct{}
 	requiredBlob        map[restic.ID]uint
-	srcBlobsList        []restic.IDs
+	srcFilesList        []restic.IDs
 }
 
-func NewRechunker(srcRepo restic.BlobLoader, dstRepo restic.BlobSaver, dstRepoPol chunker.Pol) *Rechunker {
+func NewRechunker(srcRepo restic.Repository, dstRepo restic.BlobSaver, dstRepoPol chunker.Pol) *Rechunker {
 	return &Rechunker{
-		srcRepo:         srcRepo,
-		dstRepo:         dstRepo,
-		dstRepoPol:      dstRepoPol,
-		rechunkBlobsMap: make(map[hashType]restic.IDs),
-		rewriteTreeMap:  make(map[restic.ID]restic.ID),
-		visitedBlobs:    make(map[hashType]struct{}),
-		requiredBlob:    make(map[restic.ID]uint),
-		srcBlobsList:    make([]restic.IDs, 0),
+		srcRepo:        srcRepo,
+		dstRepo:        dstRepo,
+		dstRepoPol:     dstRepoPol,
+		rechunkMap:     make(map[hashType]restic.IDs),
+		rewriteTreeMap: make(map[restic.ID]restic.ID),
+		requiredBlob:   make(map[restic.ID]uint),
+		srcFilesList:   make([]restic.IDs, 0),
 	}
 }
 
-func (rc *Rechunker) RechunkData(ctx context.Context, root restic.ID, p *progress.Counter) error {
-	numWorkers := runtime.GOMAXPROCS(0)
-	bufferPool := make(chan []byte, 4*numWorkers)
+func (rc *Rechunker) Schedule(ctx context.Context, roots []restic.ID) error {
+	visitedFiles := make(map[hashType]struct{})
+	visitedTrees := make(map[restic.ID]struct{})
 	visitor := WalkVisitor{
 		ProcessNode: func(id restic.ID, _ string, node *restic.Node, _ error) error {
-			// skip the tree if already processed
-			if _, ok := rc.rewriteTreeMap[id]; ok {
+			// skip the entire tree if that identical tree has already been processed before
+			if _, ok := visitedTrees[id]; ok {
 				return ErrSkipNode
 			}
-
-			// skip root node (node == nil)
+			// skip root node (i.e. node == nil)
 			if node == nil {
 				return nil
 			}
-			// skip non-file nodes
+			// register to visitedTrees if this is a tree node, and go on to the next node
+			if node.Type == restic.NodeTypeDir {
+				visitedTrees[id] = struct{}{}
+				return nil
+			}
+			// skip non-regular files
 			if node.Type != restic.NodeTypeFile {
 				return nil
 			}
 
 			// skip if identical file content has already been visited
 			hashval := hashOfIDs(node.Content)
-			if _, ok := rc.visitedBlobs[hashval]; ok {
-				if p != nil {
-					p.Add(1)
-				}
+			if _, ok := visitedFiles[hashval]; ok {
 				return nil
 			}
-			rc.visitedBlobs[hashval] = struct{}{}
+			visitedFiles[hashval] = struct{}{}
 
-			rc.srcBlobsList = append(rc.srcBlobsList, node.Content)
+			rc.srcFilesList = append(rc.srcFilesList, node.Content)
 			return nil
 		},
 	}
 
-	// gather file `Content`s from snapshot
-	err := Walk(ctx, rc.srcRepo, root, visitor)
-	if err != nil {
-		return err
+	// gather all unique files' `Content` field (restic.IDs) by traversing the tree
+	for _, root := range roots {
+		err := Walk(ctx, rc.srcRepo, root, visitor)
+		if err != nil {
+			return err
+		}
 	}
+
+	// compute how many time each blob is needed
+	for _, blobs := range rc.srcFilesList {
+		for _, blob := range blobs {
+			rc.requiredBlob[blob]++
+		}
+	}
+
+	// build pack-to-blobs map
+
+	// divide into small files / large files
+
+	// determine the order of files
+
+	// make packLRU and blobCache
+
+	return nil
+}
+
+func (rc *Rechunker) RechunkData(ctx context.Context, root restic.ID, p *progress.Counter) error {
+	numWorkers := runtime.GOMAXPROCS(0)
+	bufferPool := make(chan []byte, 4*numWorkers)
 
 	// create rechunk workers
 	wgUp, wgUpCtx := errgroup.WithContext(ctx)
@@ -96,7 +119,7 @@ func (rc *Rechunker) RechunkData(ctx context.Context, root restic.ID, p *progres
 				select {
 				case <-wgUpCtx.Done():
 					return wgUpCtx.Err()
-				case srcBlobs, ok = <-chFile:
+				case srcBlobs, ok = <-chFile: // TODO: change to RechunkBlobCache.Get
 					if !ok { // all files visited and chan closed
 						return nil
 					}
@@ -231,9 +254,9 @@ func (rc *Rechunker) RechunkData(ctx context.Context, root restic.ID, p *progres
 
 				// register to rechunkMap
 				hashval := hashOfIDs(srcBlobs)
-				rc.rechunkBlobsMapLock.Lock()
-				rc.rechunkBlobsMap[hashval] = dstBlobs
-				rc.rechunkBlobsMapLock.Unlock()
+				rc.rechunkMapLock.Lock()
+				rc.rechunkMap[hashval] = dstBlobs
+				rc.rechunkMapLock.Unlock()
 
 				if p != nil {
 					p.Add(1)
@@ -252,7 +275,7 @@ func (rc *Rechunker) rewriteNode(node *restic.Node) error {
 	}
 
 	hashval := hashOfIDs(node.Content)
-	dstBlobs, ok := rc.rechunkBlobsMap[hashval]
+	dstBlobs, ok := rc.rechunkMap[hashval]
 	if !ok {
 		return fmt.Errorf("can't find from rechunkBlobsMap: %v", node.Content.String())
 	}
