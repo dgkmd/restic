@@ -59,10 +59,11 @@ func TestRechunkerRechunkData(t *testing.T) {
 	_ = archiver.TestSnapshot(t, dstWantsRepo, tempDir, nil)
 
 	// do rechunking for dstTestRepo
-	rechunker := NewRechunker(srcRepo, dstTestsRepo, dstTestsRepo.Config().ChunkerPolynomial)
+	rechunker := NewRechunker(srcRepo, dstTestsRepo)
 	wg, wgCtx := errgroup.WithContext(ctx)
 	dstTestsRepo.StartPackUploader(wgCtx, wg)
-	rechunker.RechunkData(ctx, *srcSn.Tree, nil)
+	rechunker.Schedule(ctx, []restic.ID{*srcSn.Tree})
+	rechunker.RechunkData(ctx, nil)
 	dstTestsRepo.Flush(ctx)
 
 	// compare data blobs between dstWantsRepo and dstTestRepo
@@ -170,6 +171,14 @@ func buildTreeMapExtended(tree TestTree, m TreeMap) restic.ID {
 	return id
 }
 
+func NewRechunkerForTestRewriteTree(srcTree restic.BlobLoader, dstTree restic.BlobSaver) *Rechunker {
+	return &Rechunker{
+		blobLoader:     srcTree,
+		blobSaver:      dstTree,
+		rewriteTreeMap: map[restic.ID]restic.ID{},
+	}
+}
+
 func TestRechunkerRewriteTree(t *testing.T) {
 	blobIDsMap := map[string]BlobIDsPair{
 		"a":        generateBlobIDsPair(1, 1),
@@ -255,7 +264,7 @@ func TestRechunkerRewriteTree(t *testing.T) {
 	_, wantsRoot := BuildTreeMapExtended(wants)
 
 	testsRepo := WritableTreeMap{TreeMap{}}
-	rechunker := NewRechunker(srcRepo, testsRepo, 0)
+	rechunker := NewRechunkerForTestRewriteTree(srcRepo, testsRepo)
 	rechunker.rechunkMap = rechunkBlobsMap
 	testsRoot, err := rechunker.RewriteTree(context.TODO(), srcRoot)
 	if err != nil {

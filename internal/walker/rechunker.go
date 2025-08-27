@@ -17,119 +17,171 @@ import (
 
 type hashType = [32]byte
 
-// need blobCache struct for caching blobs from downloaded packs...?
-
 type Rechunker struct {
-	srcRepo             restic.Repository
-	dstRepo             restic.BlobSaver
-	dstRepoPol          chunker.Pol
-	rechunkMap          map[hashType]restic.IDs
-	rechunkMapLock sync.Mutex
-	rewriteTreeMap      map[restic.ID]restic.ID
-	requiredBlob        map[restic.ID]uint
-	srcFilesList        []restic.IDs
+	srcRepo    restic.Repository
+	dstRepo    restic.Repository
+	pol        chunker.Pol
+	blobLoader restic.BlobLoader
+	blobSaver  restic.BlobSaver
+
+	srcFilesList      []restic.IDs
+	blobRequires      map[restic.ID]uint
+	srcPackToBlobsMap map[restic.ID][]restic.Blob
+	srcBlobToPackMap  map[restic.ID]restic.ID
+	rechunkMap        map[hashType]restic.IDs
+	rechunkMapLock    sync.Mutex
+	cache             *RechunkBlobCache
+	chFile            chan restic.IDs
+	rewriteTreeMap    map[restic.ID]restic.ID
 }
 
-func NewRechunker(srcRepo restic.Repository, dstRepo restic.BlobSaver, dstRepoPol chunker.Pol) *Rechunker {
+func NewRechunker(srcRepo restic.Repository, dstRepo restic.Repository) *Rechunker {
 	return &Rechunker{
-		srcRepo:        srcRepo,
-		dstRepo:        dstRepo,
-		dstRepoPol:     dstRepoPol,
-		rechunkMap:     make(map[hashType]restic.IDs),
-		rewriteTreeMap: make(map[restic.ID]restic.ID),
-		requiredBlob:   make(map[restic.ID]uint),
-		srcFilesList:   make([]restic.IDs, 0),
+		srcRepo:    srcRepo,
+		dstRepo:    dstRepo,
+		pol:        dstRepo.Config().ChunkerPolynomial,
+		blobLoader: srcRepo,
+		blobSaver:  dstRepo,
+
+		srcFilesList:      []restic.IDs{},
+		blobRequires:      map[restic.ID]uint{},
+		srcPackToBlobsMap: map[restic.ID][]restic.Blob{},
+		srcBlobToPackMap:  map[restic.ID]restic.ID{},
+		rechunkMap:        map[hashType]restic.IDs{},
+		cache:             NewRechunkBlobCache(),
+		chFile:            make(chan restic.IDs),
+		rewriteTreeMap:    map[restic.ID]restic.ID{},
 	}
 }
 
 func (rc *Rechunker) Schedule(ctx context.Context, roots []restic.ID) error {
-	visitedFiles := make(map[hashType]struct{})
-	visitedTrees := make(map[restic.ID]struct{})
-	visitor := WalkVisitor{
-		ProcessNode: func(id restic.ID, _ string, node *restic.Node, _ error) error {
-			// skip the entire tree if that identical tree has already been processed before
-			if _, ok := visitedTrees[id]; ok {
-				return ErrSkipNode
-			}
-			// skip root node (i.e. node == nil)
-			if node == nil {
-				return nil
-			}
-			// register to visitedTrees if this is a tree node, and go on to the next node
-			if node.Type == restic.NodeTypeDir {
-				visitedTrees[id] = struct{}{}
-				return nil
-			}
-			// skip non-regular files
-			if node.Type != restic.NodeTypeFile {
-				return nil
+	visitedFiles := map[hashType]struct{}{}
+	visitedTrees := restic.IDSet{}
+
+	wg, wgCtx := errgroup.WithContext(ctx)
+	treeStream := restic.StreamTrees(wgCtx, wg, rc.srcRepo, roots, func(id restic.ID) bool {
+		visited := visitedTrees.Has(id)
+		visitedTrees.Insert(id)
+		return visited
+	}, nil)
+
+	// gather all unique file Contents under trees
+	wg.Go(func() error {
+		for tree := range treeStream {
+			if tree.Error != nil {
+				return tree.Error
 			}
 
-			// skip if identical file content has already been visited
-			hashval := hashOfIDs(node.Content)
-			if _, ok := visitedFiles[hashval]; ok {
-				return nil
+			for _, node := range tree.Nodes {
+				if node.Type == restic.NodeTypeFile {
+					hashval := hashOfIDs(node.Content)
+					if _, ok := visitedFiles[hashval]; ok {
+						continue
+					}
+					visitedFiles[hashval] = struct{}{}
+
+					rc.srcFilesList = append(rc.srcFilesList, node.Content)
+				}
 			}
-			visitedFiles[hashval] = struct{}{}
-
-			rc.srcFilesList = append(rc.srcFilesList, node.Content)
-			return nil
-		},
-	}
-
-	// gather all unique files' `Content` field (restic.IDs) by traversing the tree
-	for _, root := range roots {
-		err := Walk(ctx, rc.srcRepo, root, visitor)
-		if err != nil {
-			return err
 		}
+		return nil
+	})
+	err := wg.Wait()
+	if err != nil {
+		return err
 	}
 
 	// compute how many time each blob is needed
 	for _, blobs := range rc.srcFilesList {
 		for _, blob := range blobs {
-			rc.requiredBlob[blob]++
+			rc.blobRequires[blob]++
 		}
 	}
 
-	// build pack-to-blobs map
+	// build pack<->blob map
+	for blob := range rc.blobRequires {
+		packs := rc.srcRepo.LookupBlob(restic.DataBlob, blob)
+		if len(packs) == 0 {
+			return fmt.Errorf("can't find blob from source repo: %v", blob)
+		}
+		pb := packs[0]
 
-	// divide into small files / large files
+		// pack-to-blobs map
+		rc.srcPackToBlobsMap[pb.PackID] = append(rc.srcPackToBlobsMap[pb.PackID], pb.Blob)
 
-	// determine the order of files
+		// blob-to-pack map
+		rc.srcBlobToPackMap[pb.ID] = pb.PackID
+	}
 
-	// make packLRU and blobCache
+	// divide into small files / large files (TODO)
+
+	// determine the order of files (TODO?)
 
 	return nil
 }
 
-func (rc *Rechunker) RechunkData(ctx context.Context, root restic.ID, p *progress.Counter) error {
-	numWorkers := runtime.GOMAXPROCS(0)
+func (rc *Rechunker) RechunkData(ctx context.Context, p *progress.Counter) error {
+	numWorkers := max(runtime.GOMAXPROCS(0)-1, 1)
 	bufferPool := make(chan []byte, 4*numWorkers)
+	wgMgr, wgMgrCtx := errgroup.WithContext(ctx)
+	wgWkr, wgWkrCtx := errgroup.WithContext(ctx)
+
+	// prepare BlobCache
+	rc.cache.Start(wgMgrCtx, wgMgr, rc.srcBlobToPackMap, func(packID restic.ID) (BlobData, error) {
+		blobData := BlobData{}
+		err := rc.srcRepo.LoadBlobsFromPack(wgMgrCtx, packID, rc.srcPackToBlobsMap[packID],
+			func(blob restic.BlobHandle, buf []byte, err error) error {
+				if err != nil {
+					return err
+				}
+				newBuf := make([]byte, len(buf))
+				copy(newBuf, buf)
+				blobData[blob.ID] = newBuf
+
+				return nil
+			})
+		if err != nil {
+			return BlobData{}, err
+		}
+		return blobData, nil
+	})
+
+	// worklist feeder
+	// TODO: implement priority queue for 'all ready' files
+	wgMgr.Go(func() error {
+		for _, file := range rc.srcFilesList {
+			select {
+			case <-wgMgrCtx.Done():
+				return wgMgrCtx.Err()
+			case rc.chFile <- file:
+			}
+		}
+		close(rc.chFile)
+		return nil
+	})
 
 	// create rechunk workers
-	wgUp, wgUpCtx := errgroup.WithContext(ctx)
 	for range numWorkers {
-		wgUp.Go(func() error {
-			chnker := chunker.New(nil, rc.dstRepoPol)
+		wgWkr.Go(func() error {
+			chnker := chunker.New(nil, rc.pol)
 
 			for {
 				var srcBlobs restic.IDs
 				var ok bool
 				select {
-				case <-wgUpCtx.Done():
-					return wgUpCtx.Err()
-				case srcBlobs, ok = <-chFile: // TODO: change to RechunkBlobCache.Get
-					if !ok { // all files visited and chan closed
+				case <-wgWkrCtx.Done():
+					return wgWkrCtx.Err()
+				case srcBlobs, ok = <-rc.chFile:
+					if !ok { // all files finished and chan closed
 						return nil
 					}
 				}
 				dstBlobs := restic.IDs{}
-				wg, wgCtx := errgroup.WithContext(wgUpCtx)
+				wg, wgCtx := errgroup.WithContext(wgWkrCtx)
 
-				// run downloader/iopipe/chunker/uploader Goroutines per each file
-				// downloader: load original chunks one by one from source repo
-				chDownload := make(chan []byte)
+				// run loader/iopipe/chunker/saver Goroutines per each file
+				// loader: load original chunks one by one from source repo
+				chFront := make(chan []byte)
 				wg.Go(func() error {
 					for _, blobID := range srcBlobs {
 						var buf []byte
@@ -139,18 +191,23 @@ func (rc *Rechunker) RechunkData(ctx context.Context, root restic.ID, p *progres
 							debug.Log("make buffer (1)")
 							buf = make([]byte, chunker.MaxSize)
 						}
-						buf, err := rc.srcRepo.LoadBlob(wgCtx, restic.DataBlob, blobID, buf)
-						if err != nil {
-							return err
+
+						blob, ch := rc.cache.Get(wgCtx, wg, blobID, buf)
+						if blob == nil { // wait for blob to be downloaded
+							select {
+							case <-wgCtx.Done():
+								return wgCtx.Err()
+							case blob = <-ch:
+							}
 						}
 
 						select {
 						case <-wgCtx.Done():
 							return wgCtx.Err()
-						case chDownload <- buf:
+						case chFront <- blob:
 						}
 					}
-					close(chDownload)
+					close(chFront)
 					return nil
 				})
 
@@ -164,7 +221,7 @@ func (rc *Rechunker) RechunkData(ctx context.Context, root restic.ID, p *progres
 						case <-wgCtx.Done():
 							w.CloseWithError(wgCtx.Err())
 							return wgCtx.Err()
-						case buf, ok = <-chDownload:
+						case buf, ok = <-chFront:
 							if !ok { // EOF
 								w.Close()
 								return nil
@@ -185,8 +242,8 @@ func (rc *Rechunker) RechunkData(ctx context.Context, root restic.ID, p *progres
 				})
 
 				// chunker: rechunk filestream with destination repo's chunking parameter
-				chnker.Reset(r, rc.dstRepoPol)
-				chUpload := make(chan []byte)
+				chnker.Reset(r, rc.pol)
+				chBack := make(chan []byte)
 				wg.Go(func() error {
 					for {
 						var buf []byte
@@ -203,7 +260,7 @@ func (rc *Rechunker) RechunkData(ctx context.Context, root restic.ID, p *progres
 							case bufferPool <- buf:
 							default:
 							}
-							close(chUpload)
+							close(chBack)
 							return nil
 						}
 						if err != nil {
@@ -215,12 +272,12 @@ func (rc *Rechunker) RechunkData(ctx context.Context, root restic.ID, p *progres
 						case <-wgCtx.Done():
 							r.CloseWithError(wgCtx.Err())
 							return wgCtx.Err()
-						case chUpload <- chunk.Data:
+						case chBack <- chunk.Data:
 						}
 					}
 				})
 
-				// uploader: save rechunked blobs into destination repo
+				// saver: save rechunked blobs into destination repo
 				wg.Go(func() error {
 					for {
 						var blobData []byte
@@ -228,7 +285,7 @@ func (rc *Rechunker) RechunkData(ctx context.Context, root restic.ID, p *progres
 						select {
 						case <-wgCtx.Done():
 							return wgCtx.Err()
-						case blobData, ok = <-chUpload:
+						case blobData, ok = <-chBack:
 							if !ok { // EOF
 								return nil
 							}
@@ -265,8 +322,15 @@ func (rc *Rechunker) RechunkData(ctx context.Context, root restic.ID, p *progres
 		})
 	}
 
-	// wait for rechunk jobs to finish
-	return wgUp.Wait()
+	// wait for rechunk workers to finish
+	err := wgWkr.Wait()
+	if err != nil {
+		return err
+	}
+	// finish manager jobs
+	rc.cache.Stop()
+	err = wgMgr.Wait()
+	return err
 }
 
 func (rc *Rechunker) rewriteNode(node *restic.Node) error {
@@ -290,7 +354,7 @@ func (rc *Rechunker) RewriteTree(ctx context.Context, nodeID restic.ID) (restic.
 		return newID, nil
 	}
 
-	curTree, err := restic.LoadTree(ctx, rc.srcRepo, nodeID)
+	curTree, err := restic.LoadTree(ctx, rc.blobLoader, nodeID)
 	if err != nil {
 		return restic.ID{}, err
 	}
@@ -332,9 +396,21 @@ func (rc *Rechunker) RewriteTree(ctx context.Context, nodeID restic.ID) (restic.
 	}
 
 	// Save new tree
-	newTreeID, _, _, err := rc.dstRepo.SaveBlob(ctx, restic.TreeBlob, tree, restic.ID{}, false)
+	newTreeID, _, _, err := rc.blobSaver.SaveBlob(ctx, restic.TreeBlob, tree, restic.ID{}, false)
 	rc.rewriteTreeMap[nodeID] = newTreeID
 	return newTreeID, err
+}
+
+func (rc *Rechunker) NumFiles() int {
+	return len(rc.srcFilesList)
+}
+
+func (rc *Rechunker) GetRewrittenTree(originalTree restic.ID) (restic.ID, error) {
+	newID, ok := rc.rewriteTreeMap[originalTree]
+	if !ok {
+		return restic.ID{}, fmt.Errorf("rewritten tree does not exist for original tree %v", originalTree)
+	}
+	return newID, nil
 }
 
 func hashOfIDs(ids restic.IDs) hashType {
