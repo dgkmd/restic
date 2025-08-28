@@ -247,9 +247,9 @@ func runRechunk(ctx context.Context, roots []restic.ID, rechunker *walker.Rechun
 	if err != nil {
 		return err
 	}
-	Verbosef("Scheduling Done. Running rechunk...\n")
+	Verbosef("Scheduling Done. Rechunking data...\n")
 
-	bar := newProgressMax(!quiet, uint64(rechunker.NumFiles()), "files rechunked")
+	bar := newProgressMax(!quiet, uint64(rechunker.NumFilesToProcess()), "files rechunked")
 	err = rechunker.RechunkData(ctx, bar)
 	if err != nil {
 		return err

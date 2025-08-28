@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"sync"
+	// "time"
 
 	lru "github.com/hashicorp/golang-lru/v2"
 	"github.com/restic/restic/internal/debug"
@@ -86,6 +87,16 @@ func (rcc *RechunkChainDict) Set(srcBlobs restic.IDs, startOffset, endOffset uin
 
 //////////
 
+// var dbg = map[string]float64{}
+// var dbgLock = sync.Mutex{}
+
+// func dbgTime(name string, since time.Time) {
+// 	dbgLock.Lock()
+// 	dbg[name] += time.Since(since).Seconds()
+// 	debug.Log("%v: %v", name, dbg[name])
+// 	dbgLock.Unlock()
+// }
+
 const LRU_SIZE = 100
 
 type PackLRU = *lru.Cache[restic.ID, []restic.ID]
@@ -106,13 +117,16 @@ type RechunkBlobCache struct {
 	blobToPackMap  map[restic.ID]restic.ID
 }
 
-func NewRechunkBlobCache() *RechunkBlobCache {
+func NewRechunkBlobCache(ctx context.Context, wg *errgroup.Group, blobToPackMap map[restic.ID]restic.ID,
+	downloadFn func(packID restic.ID) (BlobData, error), onReady func(packID restic.ID), onEvict func(packID restic.ID)) *RechunkBlobCache {
 	rbc := &RechunkBlobCache{
 		blobs:          map[restic.ID]packBlobData{},
 		packDownloadCh: make(chan restic.ID),
 		packWaiter:     map[restic.ID]chan struct{}{},
+		blobToPackMap:  blobToPackMap,
 	}
-	lru, err := lru.NewWithEvict[restic.ID, []restic.ID](LRU_SIZE, func(k restic.ID, v []restic.ID) {
+	lru, err := lru.NewWithEvict(LRU_SIZE, func(k restic.ID, v []restic.ID) {
+		// dbgStart := time.Now()
 		rbc.blobsLock.Lock()
 		for _, blob := range v {
 			delete(rbc.blobs, blob)
@@ -121,11 +135,60 @@ func NewRechunkBlobCache() *RechunkBlobCache {
 		delete(rbc.packWaiter, k)
 		rbc.packWaiterLock.Unlock()
 		rbc.blobsLock.Unlock()
+		// dbgTime("evict", dbgStart)
+		if onEvict != nil {
+			onEvict(k)
+		}
 	})
 	if err != nil {
 		panic(err)
 	}
 	rbc.pcklru = lru
+
+	wg.Go(func() error {
+		for {
+			var packID restic.ID
+			var ok bool
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			case packID, ok = <-rbc.packDownloadCh:
+				if !ok { // job complete
+					return nil
+				}
+			}
+
+			if rbc.pcklru.Contains(packID) {
+				// pack already downloaded by the previous request
+				continue
+			}
+			// dbgStart := time.Now()
+			blobData, err := downloadFn(packID)
+			// dbgTime("download", dbgStart)
+			if err != nil {
+				return err
+			}
+			blobIDs := make([]restic.ID, 0, len(blobData))
+			for id := range blobData {
+				blobIDs = append(blobIDs, id)
+			}
+			rbc.blobsLock.Lock()
+			for id, data := range blobData {
+				rbc.blobs[id] = packBlobData{
+					data:   data,
+					packID: packID,
+				}
+			}
+			rbc.blobsLock.Unlock()
+			_ = rbc.pcklru.Add(packID, blobIDs)
+			if onReady != nil {
+				onReady(packID)
+			}
+			rbc.packWaiterLock.Lock()
+			close(rbc.packWaiter[packID])
+			rbc.packWaiterLock.Unlock()
+		}
+	})
 
 	return rbc
 }
@@ -135,13 +198,16 @@ func (rbc *RechunkBlobCache) Get(ctx context.Context, wg *errgroup.Group, id res
 	blob, ok := rbc.blobs[id]
 	rbc.blobsLock.RUnlock()
 	if ok {
+		// debug.Log("cache hit")
 		_, _ = rbc.pcklru.Get(blob.packID) // update recency
 		if cap(buf) < len(blob.data) {
 			debug.Log("received buffer has size smaller than chunk. It's likely that something is wrong!")
 			buf = make([]byte, len(blob.data))
 		}
+		// dbgStart := time.Now()
 		buf = buf[:len(blob.data)]
 		copy(buf, blob.data)
+		// dbgTime("blobcopy", dbgStart)
 		return buf, nil
 	}
 
@@ -174,59 +240,15 @@ func (rbc *RechunkBlobCache) Get(ctx context.Context, wg *errgroup.Group, id res
 		if !ok {
 			return fmt.Errorf("blob entry missing right after pack download. Please report this error at https://github.com/restic/restic/issues/")
 		}
+		// dbgStart := time.Now()
 		buf = buf[:len(blob.data)]
 		copy(buf, blob.data)
+		// dbgTime("blobcopy", dbgStart)
 		chBlobData <- buf
 		return nil
 	})
 
 	return nil, chBlobData
-}
-
-func (rbc *RechunkBlobCache) Start(ctx context.Context, wg *errgroup.Group, blobToPackMap map[restic.ID]restic.ID,
-	downloadFn func(packID restic.ID) (BlobData, error)) {
-
-	rbc.blobToPackMap = blobToPackMap
-
-	wg.Go(func() error {
-		for {
-			var packID restic.ID
-			var ok bool
-			select {
-			case <-ctx.Done():
-				return ctx.Err()
-			case packID, ok = <-rbc.packDownloadCh:
-				if !ok { // job complete
-					return nil
-				}
-			}
-
-			if rbc.pcklru.Contains(packID) {
-				// pack already downloaded by the previous request
-				continue
-			}
-			blobData, err := downloadFn(packID)
-			if err != nil {
-				return err
-			}
-			blobIDs := []restic.ID{}
-			for id := range blobData {
-				blobIDs = append(blobIDs, id)
-			}
-			rbc.blobsLock.Lock()
-			for id, data := range blobData {
-				rbc.blobs[id] = packBlobData{
-					data:   data,
-					packID: packID,
-				}
-			}
-			rbc.blobsLock.Unlock()
-			_ = rbc.pcklru.Add(packID, blobIDs)
-			rbc.packWaiterLock.Lock()
-			close(rbc.packWaiter[packID])
-			rbc.packWaiterLock.Unlock()
-		}
-	})
 }
 
 func (rbc *RechunkBlobCache) Stop() {
