@@ -166,6 +166,16 @@ func (rc *Rechunker) Plan(ctx context.Context, roots []restic.ID) error {
 	return nil
 }
 
+// TODO: implement jump request from saver to loader, which cascades toward downstream.
+// to achieve correct behavior, each component has to do the following:
+// saver: send new starting position to loader (blob index, starting offset) w/ ch
+// loader: just send new blob with new sequence number (increasing only)
+// iopipe: when new sequence number detected, close iopipe with specific error (NewSequenceNumber),
+//         make new iopipe, and send the new reader with new sequence number to chunker w/ ch
+// chunker: when facing NewSequenceNumber error, wait for new reader from ch, reset chunker with that reader,
+//          and send new chunks with new sequence number
+// saver: discard chunks until new sequence number arrives. In the meantime, update dstBlobs and new offset.
+//        implementation change) instead of chunk.Start, should use chunk.Length and internally tracked offsets.
 func (rc *Rechunker) RechunkData(ctx context.Context, p *progress.Counter) error {
 	numWorkers := max(runtime.GOMAXPROCS(0)-1, 1)
 	bufferPool := make(chan []byte, 4*numWorkers)
