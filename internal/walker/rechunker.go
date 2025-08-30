@@ -21,6 +21,10 @@ type fileType struct {
 	restic.IDs
 	blobsHash hashType
 }
+type blobInfo struct {
+	length uint
+	packID restic.ID
+}
 
 type Rechunker struct {
 	srcRepo    restic.Repository
@@ -29,22 +33,23 @@ type Rechunker struct {
 	blobLoader restic.BlobLoader
 	blobSaver  restic.BlobSaver
 	cache      *RechunkBlobCache
+	chainDict  *RechunkChainDict
 
-	// immutable once built (by design)
-	filesList     []restic.IDs
-	blobToPackMap map[restic.ID]restic.ID
+	// read-only once built
+	filesList  []restic.IDs
+	blobLookup map[restic.ID]blobInfo
 
 	// RW by dedicated worker
-	blobRequires    map[restic.ID]int
-	sPackRequires   map[hashType]int
-	sPackToFilesMap map[restic.ID][]fileType
+	blobRequires  map[restic.ID]int
+	sPackRequires map[hashType]int
+	sPackToFiles  map[restic.ID][]fileType
 
 	// concurrently accessed across workers
 	priorityFilesList     []restic.IDs
-	packToBlobsMap        map[restic.ID][]restic.Blob
+	packToBlobs           map[restic.ID][]restic.Blob
 	rechunkMap            map[hashType]restic.IDs
 	priorityFilesListLock sync.Mutex
-	packToBlobsMapLock    sync.Mutex
+	packToBlobsLock       sync.Mutex
 	rechunkMapLock        sync.Mutex
 
 	// used in RewriteTree
@@ -58,14 +63,15 @@ func NewRechunker(srcRepo restic.Repository, dstRepo restic.Repository) *Rechunk
 		pol:        dstRepo.Config().ChunkerPolynomial,
 		blobLoader: srcRepo,
 		blobSaver:  dstRepo,
+		chainDict:  NewRechunkChainDict(),
 
 		filesList:         []restic.IDs{},
-		blobToPackMap:     map[restic.ID]restic.ID{},
+		blobLookup:        map[restic.ID]blobInfo{},
 		blobRequires:      map[restic.ID]int{},
 		sPackRequires:     map[hashType]int{},
-		sPackToFilesMap:   map[restic.ID][]fileType{},
+		sPackToFiles:      map[restic.ID][]fileType{},
 		priorityFilesList: []restic.IDs{},
-		packToBlobsMap:    map[restic.ID][]restic.Blob{},
+		packToBlobs:       map[restic.ID][]restic.Blob{},
 		rechunkMap:        map[hashType]restic.IDs{},
 		rewriteTreeMap:    map[restic.ID]restic.ID{},
 	}
@@ -133,8 +139,11 @@ func (rc *Rechunker) Plan(ctx context.Context, roots []restic.ID) error {
 		}
 		pb := packs[0]
 
-		rc.packToBlobsMap[pb.PackID] = append(rc.packToBlobsMap[pb.PackID], pb.Blob)
-		rc.blobToPackMap[pb.Blob.ID] = pb.PackID
+		rc.packToBlobs[pb.PackID] = append(rc.packToBlobs[pb.PackID], pb.Blob)
+		rc.blobLookup[pb.Blob.ID] = blobInfo{
+			length: pb.Length,
+			packID: pb.PackID,
+		}
 	}
 
 	// build pack<->file metadata for small files
@@ -145,12 +154,12 @@ func (rc *Rechunker) Plan(ctx context.Context, roots []restic.ID) error {
 		hashval := hashOfIDs(blobs)
 		packSet := restic.IDSet{}
 		for _, blob := range blobs {
-			pack := rc.blobToPackMap[blob]
+			pack := rc.blobLookup[blob].packID
 			packSet[pack] = struct{}{}
 		}
 		rc.sPackRequires[hashval] = len(packSet)
 		for p := range packSet {
-			rc.sPackToFilesMap[p] = append(rc.sPackToFilesMap[p], fileType{blobs, hashval})
+			rc.sPackToFiles[p] = append(rc.sPackToFiles[p], fileType{blobs, hashval})
 		}
 	}
 
@@ -166,12 +175,12 @@ func (rc *Rechunker) RechunkData(ctx context.Context, p *progress.Counter) error
 	var blobGet func(blobID restic.ID, buf []byte) ([]byte, error)
 
 	// blob cache
-	rc.cache = NewRechunkBlobCache(wgMgrCtx, wgMgr, rc.blobToPackMap, func(packID restic.ID) (BlobData, error) {
+	rc.cache = NewRechunkBlobCache(wgMgrCtx, wgMgr, rc.blobLookup, func(packID restic.ID) (BlobData, error) {
 		// downloadFn implementation
 		blobData := BlobData{}
-		rc.packToBlobsMapLock.Lock()
-		blobs := rc.packToBlobsMap[packID]
-		rc.packToBlobsMapLock.Unlock()
+		rc.packToBlobsLock.Lock()
+		blobs := rc.packToBlobs[packID]
+		rc.packToBlobsLock.Unlock()
 		err := rc.srcRepo.LoadBlobsFromPack(wgMgrCtx, packID, blobs,
 			func(blob restic.BlobHandle, buf []byte, err error) error {
 				if err != nil {
@@ -189,7 +198,7 @@ func (rc *Rechunker) RechunkData(ctx context.Context, p *progress.Counter) error
 		return blobData, nil
 	}, func(packID restic.ID) {
 		// onPackReady implementation
-		files := rc.sPackToFilesMap[packID]
+		files := rc.sPackToFiles[packID]
 		for _, file := range files {
 			if rc.sPackRequires[file.blobsHash] > 0 {
 				rc.sPackRequires[file.blobsHash]--
@@ -202,11 +211,16 @@ func (rc *Rechunker) RechunkData(ctx context.Context, p *progress.Counter) error
 		}
 	}, func(packID restic.ID) {
 		// onPackEvict implementation
-		files := rc.sPackToFilesMap[packID]
+		files := rc.sPackToFiles[packID]
+		file_remaining := false
 		for _, file := range files {
 			// files with sPackRequires==0 has already gone to priorityFilesList, so ignore them
 			if rc.sPackRequires[file.blobsHash] > 0 {
 				rc.sPackRequires[file.blobsHash]++
+				file_remaining = true
+			}
+			if !file_remaining {
+				rc.sPackToFiles[packID] = []fileType{}
 			}
 		}
 	})
@@ -291,10 +305,10 @@ func (rc *Rechunker) RechunkData(ctx context.Context, p *progress.Counter) error
 			}
 			rc.blobRequires[id]--
 			if rc.blobRequires[id] == 0 {
-				pack := rc.blobToPackMap[id]
-				rc.packToBlobsMapLock.Lock()
-				rc.packToBlobsMap[pack] = slices.DeleteFunc(rc.packToBlobsMap[pack], func(b restic.Blob) bool { return b.ID == id })
-				rc.packToBlobsMapLock.Unlock()
+				pack := rc.blobLookup[id].packID
+				rc.packToBlobsLock.Lock()
+				rc.packToBlobs[pack] = slices.DeleteFunc(rc.packToBlobs[pack], func(b restic.Blob) bool { return b.ID == id })
+				rc.packToBlobsLock.Unlock()
 			}
 		}
 	})
@@ -316,6 +330,19 @@ func (rc *Rechunker) RechunkData(ctx context.Context, p *progress.Counter) error
 					}
 				}
 				dstBlobs := restic.IDs{}
+				var srcBlobEndPos []uint
+
+				isLargeFile := len(srcBlobs) >= SMALL_FILE_THRESHOLD
+				if isLargeFile { // for larger files, use RechunkChainDict
+					srcBlobEndPos = make([]uint, len(srcBlobs))
+					var offset uint
+					for i, blob := range srcBlobs {
+						n := rc.blobLookup[blob].length
+						offset += n
+						srcBlobEndPos[i] = offset
+					}
+				}
+
 				wg, wgCtx := errgroup.WithContext(wgWkrCtx)
 
 				// run loader/iopipe/chunker/saver Goroutines per each file
@@ -335,8 +362,12 @@ func (rc *Rechunker) RechunkData(ctx context.Context, p *progress.Counter) error
 						if err != nil {
 							return err
 						}
-						chBlobLoaded <- blobID
 
+						select {
+						case <-wgCtx.Done():
+							return wgCtx.Err()
+						case chBlobLoaded <- blobID:
+						}
 						select {
 						case <-wgCtx.Done():
 							return wgCtx.Err()
@@ -379,7 +410,7 @@ func (rc *Rechunker) RechunkData(ctx context.Context, p *progress.Counter) error
 
 				// chunker: rechunk filestream with destination repo's chunking parameter
 				chnker.Reset(r, rc.pol)
-				chBack := make(chan []byte)
+				chBack := make(chan chunker.Chunk)
 				wg.Go(func() error {
 					for {
 						var buf []byte
@@ -408,35 +439,59 @@ func (rc *Rechunker) RechunkData(ctx context.Context, p *progress.Counter) error
 						case <-wgCtx.Done():
 							r.CloseWithError(wgCtx.Err())
 							return wgCtx.Err()
-						case chBack <- chunk.Data:
+						case chBack <- chunk:
 						}
 					}
 				})
 
 				// saver: save rechunked blobs into destination repo
 				wg.Go(func() error {
+					var blobStartPos uint
+					idx := 0
+					eof := len(srcBlobs)
+
 					for {
-						var blobData []byte
+						var chunk chunker.Chunk
 						var ok bool
 						select {
 						case <-wgCtx.Done():
 							return wgCtx.Err()
-						case blobData, ok = <-chBack:
+						case chunk, ok = <-chBack:
 							if !ok { // EOF
 								return nil
 							}
 						}
 
-						blobID, _, _, err := rc.dstRepo.SaveBlob(ctx, restic.DataBlob, blobData, restic.ID{}, false)
+						blobData := chunk.Data
+						dstBlobID, _, _, err := rc.dstRepo.SaveBlob(ctx, restic.DataBlob, blobData, restic.ID{}, false)
 						if err != nil {
 							return err
+						}
+
+						if isLargeFile { // add chunk to chainDict
+							chunkSrcBlobs := []restic.ID{}
+							startOffset := chunk.Start - blobStartPos
+							endPos := chunk.Start + chunk.Length
+							for idx < eof && endPos <= srcBlobEndPos[idx] {
+								blobStartPos = srcBlobEndPos[idx]
+								chunkSrcBlobs = append(chunkSrcBlobs, srcBlobs[idx])
+								idx++
+							}
+							endOffset := endPos - blobStartPos
+							if endOffset > 0 {
+								chunkSrcBlobs = append(chunkSrcBlobs, srcBlobs[idx])
+							}
+							err := rc.chainDict.Add(chunkSrcBlobs, startOffset, endOffset, dstBlobID)
+							if err != nil {
+								return err
+							}
 						}
 
 						select {
 						case bufferPool <- blobData:
 						default:
 						}
-						dstBlobs = append(dstBlobs, blobID)
+						dstBlobs = append(dstBlobs, dstBlobID)
 					}
 				})
 

@@ -14,10 +14,10 @@ import (
 type link interface{} // union of {terminalLink, continuedLink}
 type terminalLink struct {
 	dstBlob restic.ID
-	offset  int32
+	offset  uint
 }
 type continuedLink map[restic.ID]link
-type linkIndex map[int32]link
+type linkIndex map[uint]link
 type chainDict map[restic.ID]linkIndex
 
 type RechunkChainDict struct {
@@ -32,7 +32,7 @@ func NewRechunkChainDict() *RechunkChainDict {
 	}
 }
 
-func (rcd *RechunkChainDict) Get(srcBlobs restic.IDs, offset int32) (dstBlobs restic.IDs, numFinishedBlobs int, newOffset int32) {
+func (rcd *RechunkChainDict) Get(srcBlobs restic.IDs, offset uint) (dstBlobs restic.IDs, numFinishedBlobs int, newOffset uint) {
 	if len(srcBlobs) == 0 { // nothing to return
 		return
 	}
@@ -85,7 +85,7 @@ func (rcd *RechunkChainDict) Get(srcBlobs restic.IDs, offset int32) (dstBlobs re
 	}
 }
 
-func (rcd *RechunkChainDict) Add(srcBlobs restic.IDs, startOffset, endOffset int32, dstBlob restic.ID) error {
+func (rcd *RechunkChainDict) Add(srcBlobs restic.IDs, startOffset, endOffset uint, dstBlob restic.ID) error {
 	if len(srcBlobs) == 0 {
 		return fmt.Errorf("empty srcBlobs")
 	}
@@ -172,7 +172,7 @@ type BlobData = map[restic.ID][]byte
 type RechunkBlobCache struct {
 	pcklru         PackLRU
 	packDownloadCh chan restic.ID
-	blobToPackMap  map[restic.ID]restic.ID
+	blobLookup     map[restic.ID]blobInfo
 
 	blobs          map[restic.ID]packBlobData
 	packWaiter     map[restic.ID]chan struct{}
@@ -180,11 +180,11 @@ type RechunkBlobCache struct {
 	packWaiterLock sync.Mutex
 }
 
-func NewRechunkBlobCache(ctx context.Context, wg *errgroup.Group, blobToPackMap map[restic.ID]restic.ID,
+func NewRechunkBlobCache(ctx context.Context, wg *errgroup.Group, blobLookup map[restic.ID]blobInfo,
 	downloadFn func(packID restic.ID) (BlobData, error), onPackReady func(packID restic.ID), onPackEvict func(packID restic.ID)) *RechunkBlobCache {
 	rbc := &RechunkBlobCache{
 		packDownloadCh: make(chan restic.ID),
-		blobToPackMap:  blobToPackMap,
+		blobLookup:     blobLookup,
 		blobs:          map[restic.ID]packBlobData{},
 		packWaiter:     map[restic.ID]chan struct{}{},
 	}
@@ -271,7 +271,7 @@ func (rbc *RechunkBlobCache) Get(ctx context.Context, wg *errgroup.Group, id res
 	// when blob does not exist in cache: return async ch and queue pack download
 	ch := make(chan []byte, 1)
 	wg.Go(func() error {
-		packID := rbc.blobToPackMap[id]
+		packID := rbc.blobLookup[id].packID
 		rbc.packWaiterLock.Lock()
 		chWaiter, ok := rbc.packWaiter[packID]
 		if !ok {
