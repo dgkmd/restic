@@ -62,7 +62,7 @@ func TestRechunkerRechunkData(t *testing.T) {
 	rechunker := NewRechunker(srcRepo, dstTestsRepo)
 	wg, wgCtx := errgroup.WithContext(ctx)
 	dstTestsRepo.StartPackUploader(wgCtx, wg)
-	rechunker.Schedule(ctx, []restic.ID{*srcSn.Tree})
+	rechunker.Plan(ctx, []restic.ID{*srcSn.Tree})
 	rechunker.RechunkData(ctx, nil)
 	dstTestsRepo.Flush(ctx)
 

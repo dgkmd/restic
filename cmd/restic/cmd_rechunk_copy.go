@@ -243,7 +243,7 @@ func runRechunkCopy(ctx context.Context, opts RechunkCopyOptions, gopts GlobalOp
 
 func runRechunk(ctx context.Context, roots []restic.ID, rechunker *walker.Rechunker, quiet bool) error {
 	Verbosef("Rechunk scheduling start...\n")
-	err := rechunker.Schedule(ctx, roots)
+	err := rechunker.Plan(ctx, roots)
 	if err != nil {
 		return err
 	}
