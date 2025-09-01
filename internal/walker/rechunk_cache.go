@@ -39,6 +39,7 @@ func (rcd *RechunkChainDict) Get(srcBlobs restic.IDs, offset uint) (dstBlobs res
 
 	rcd.lock.RLock()
 	defer rcd.lock.RUnlock()
+
 	lnk, ok := rcd.dict[srcBlobs[0]][offset]
 	if !ok { // dict entry not found
 		return
@@ -48,11 +49,7 @@ func (rcd *RechunkChainDict) Get(srcBlobs restic.IDs, offset uint) (dstBlobs res
 	for {
 		switch v := lnk.(type) {
 		case terminalLink:
-			if dstBlobs == nil {
-				dstBlobs = restic.IDs{}
-			}
 			dstBlobs = append(dstBlobs, v.dstBlob)
-
 			newOffset = v.offset
 			numFinishedBlobs += currentConsumedBlobs
 			currentConsumedBlobs = 0
@@ -73,6 +70,7 @@ func (rcd *RechunkChainDict) Get(srcBlobs restic.IDs, offset uint) (dstBlobs res
 				if !ok {
 					return
 				}
+				_ = lnk.(terminalLink)
 			} else { // go on to next blob
 				lnk, ok = v[srcBlobs[0]]
 				if !ok {
@@ -93,28 +91,28 @@ func (rcd *RechunkChainDict) Add(srcBlobs restic.IDs, startOffset, endOffset uin
 		return fmt.Errorf("wrong value. len(srcBlob)==1 and startOffset>endOffset")
 	}
 
-	numContinuedLink := len(srcBlobs)
-	if endOffset != 0 {
-		numContinuedLink--
-	}
-
 	rcd.lock.Lock()
 	defer rcd.lock.Unlock()
+
 	idx, ok := rcd.dict[srcBlobs[0]]
 	if !ok {
-		rcd.dict[srcBlobs[0]] = idx
+		rcd.dict[srcBlobs[0]] = linkIndex{}
+		idx = rcd.dict[srcBlobs[0]]
 	}
+
+	// create link head
+	numContinuedLink := len(srcBlobs) - 1
+	singleTerminalLink := (numContinuedLink == 0)
 	lnk, ok := idx[startOffset]
-	shouldBeTerminalLink := (numContinuedLink == 0)
-	if ok { // type assertion
-		if shouldBeTerminalLink {
+	if ok { // index exists; type assertion
+		if singleTerminalLink {
 			_ = lnk.(terminalLink)
-			return nil
+			return nil // nothing to touch
 		} else {
 			_ = lnk.(continuedLink)
 		}
 	} else { // index does not exist
-		if shouldBeTerminalLink {
+		if singleTerminalLink {
 			idx[startOffset] = terminalLink{
 				dstBlob: dstBlob,
 				offset:  endOffset,
@@ -126,29 +124,25 @@ func (rcd *RechunkChainDict) Add(srcBlobs restic.IDs, startOffset, endOffset uin
 		}
 	}
 	srcBlobs = srcBlobs[1:]
+
+	// build remaining continuedLink chain
 	for range numContinuedLink - 1 {
-		v := lnk.(continuedLink)
-		lnk, ok = v[srcBlobs[0]]
+		c := lnk.(continuedLink)
+		lnk, ok = c[srcBlobs[0]]
 		if !ok {
-			v[srcBlobs[0]] = continuedLink{}
-			lnk = v[srcBlobs[0]]
+			c[srcBlobs[0]] = continuedLink{}
+			lnk = c[srcBlobs[0]]
 		}
 		srcBlobs = srcBlobs[1:]
 	}
-	v := lnk.(continuedLink)
-	var blob restic.ID
-	if len(srcBlobs) == 0 { // should branch to here if endOffset == 0
-		blob = rcd.nullID
-	} else if len(srcBlobs) == 1 { // should branch to here if endOffset != 0
-		blob = srcBlobs[0]
-	} else {
-		panic("faulty logic")
-	}
-	lnk, ok = v[blob]
-	if ok {
+
+	// create terminalLink
+	c := lnk.(continuedLink)
+	lnk, ok = c[srcBlobs[0]]
+	if ok { // found that entire chain existed!
 		_ = lnk.(terminalLink)
 	} else {
-		v[blob] = terminalLink{
+		c[srcBlobs[0]] = terminalLink{
 			dstBlob: dstBlob,
 			offset:  endOffset,
 		}
@@ -260,7 +254,7 @@ func (rbc *RechunkBlobCache) Get(ctx context.Context, wg *errgroup.Group, id res
 	if ok { // when blob exists in cache: return that blob
 		_, _ = rbc.pcklru.Get(blob.packID) // update recency
 		if cap(buf) < len(blob.data) {
-			debug.Log("received buffer has size smaller than chunk. It's likely that something is wrong!")
+			debug.Log("buffer has smaller capacity than chunk size. Something might be wrong!")
 			buf = make([]byte, len(blob.data))
 		}
 		buf = buf[:len(blob.data)]
@@ -296,6 +290,10 @@ func (rbc *RechunkBlobCache) Get(ctx context.Context, wg *errgroup.Group, id res
 		rbc.blobsLock.RUnlock()
 		if !ok {
 			return fmt.Errorf("blob entry missing right after pack download. Please report this error at https://github.com/restic/restic/issues/")
+		}
+		if cap(buf) < len(blob.data) {
+			debug.Log("buffer has smaller capacity than chunk size. Something might be wrong!")
+			buf = make([]byte, len(blob.data))
 		}
 		buf = buf[:len(blob.data)]
 		copy(buf, blob.data)

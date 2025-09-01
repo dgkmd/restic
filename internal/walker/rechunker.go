@@ -3,14 +3,13 @@ package walker
 import (
 	"context"
 	"crypto/sha256"
+	"errors"
 	"fmt"
 	"io"
 	"runtime"
-	"slices"
 	"sync"
 
 	"github.com/restic/chunker"
-	"github.com/restic/restic/internal/debug"
 	"github.com/restic/restic/internal/restic"
 	"github.com/restic/restic/internal/ui/progress"
 	"golang.org/x/sync/errgroup"
@@ -26,18 +25,38 @@ type blobInfo struct {
 	packID restic.ID
 }
 
+type chFrontType struct {
+	seqNum int
+	blob   []byte
+}
+type chMidType struct {
+	seqNum int
+	reader *io.PipeReader
+}
+type chBackType struct {
+	seqNum int
+	chunk  chunker.Chunk
+}
+type chJumpType struct {
+	seqNum  int
+	blobIdx int
+	offset  uint
+}
+
+var ErrNewSequence = errors.New("new sequence")
+
 type Rechunker struct {
 	srcRepo    restic.Repository
 	dstRepo    restic.Repository
 	pol        chunker.Pol
 	blobLoader restic.BlobLoader
 	blobSaver  restic.BlobSaver
-	cache      *RechunkBlobCache
 	chainDict  *RechunkChainDict
 
 	// read-only once built
-	filesList  []restic.IDs
-	blobLookup map[restic.ID]blobInfo
+	filesList   []restic.IDs
+	blobLookup  map[restic.ID]blobInfo
+	packToBlobs map[restic.ID][]restic.Blob
 
 	// RW by dedicated worker
 	blobRequires  map[restic.ID]int
@@ -46,10 +65,8 @@ type Rechunker struct {
 
 	// concurrently accessed across workers
 	priorityFilesList     []restic.IDs
-	packToBlobs           map[restic.ID][]restic.Blob
 	rechunkMap            map[hashType]restic.IDs
 	priorityFilesListLock sync.Mutex
-	packToBlobsLock       sync.Mutex
 	rechunkMapLock        sync.Mutex
 
 	// used in RewriteTree
@@ -58,28 +75,34 @@ type Rechunker struct {
 
 func NewRechunker(srcRepo restic.Repository, dstRepo restic.Repository) *Rechunker {
 	return &Rechunker{
-		srcRepo:    srcRepo,
-		dstRepo:    dstRepo,
-		pol:        dstRepo.Config().ChunkerPolynomial,
-		blobLoader: srcRepo,
-		blobSaver:  dstRepo,
-		chainDict:  NewRechunkChainDict(),
-
-		filesList:         []restic.IDs{},
-		blobLookup:        map[restic.ID]blobInfo{},
-		blobRequires:      map[restic.ID]int{},
-		sPackRequires:     map[hashType]int{},
-		sPackToFiles:      map[restic.ID][]fileType{},
-		priorityFilesList: []restic.IDs{},
-		packToBlobs:       map[restic.ID][]restic.Blob{},
-		rechunkMap:        map[hashType]restic.IDs{},
-		rewriteTreeMap:    map[restic.ID]restic.ID{},
+		srcRepo:        srcRepo,
+		dstRepo:        dstRepo,
+		pol:            dstRepo.Config().ChunkerPolynomial,
+		blobLoader:     srcRepo,
+		blobSaver:      dstRepo,
+		chainDict:      NewRechunkChainDict(),
+		rechunkMap:     map[hashType]restic.IDs{},
+		rewriteTreeMap: map[restic.ID]restic.ID{},
 	}
 }
 
 const SMALL_FILE_THRESHOLD = 25
+const LARGE_FILE_THRESHOLD = 50
+
+func (rc *Rechunker) Reset() {
+	rc.filesList = nil
+	rc.priorityFilesList = nil
+
+	rc.blobLookup = map[restic.ID]blobInfo{}
+	rc.packToBlobs = map[restic.ID][]restic.Blob{}
+	rc.blobRequires = map[restic.ID]int{}
+	rc.sPackRequires = map[hashType]int{}
+	rc.sPackToFiles = map[restic.ID][]fileType{}
+}
 
 func (rc *Rechunker) Plan(ctx context.Context, roots []restic.ID) error {
+	rc.Reset()
+
 	visitedFiles := map[hashType]struct{}{}
 	visitedTrees := restic.IDSet{}
 
@@ -141,56 +164,40 @@ func (rc *Rechunker) Plan(ctx context.Context, roots []restic.ID) error {
 
 		rc.packToBlobs[pb.PackID] = append(rc.packToBlobs[pb.PackID], pb.Blob)
 		rc.blobLookup[pb.Blob.ID] = blobInfo{
-			length: pb.Length,
+			length: pb.DataLength(),
 			packID: pb.PackID,
 		}
 	}
 
 	// build pack<->file metadata for small files
-	for _, blobs := range rc.filesList {
-		if len(blobs) > SMALL_FILE_THRESHOLD {
+	for _, file := range rc.filesList {
+		if len(file) >= SMALL_FILE_THRESHOLD {
 			continue
 		}
-		hashval := hashOfIDs(blobs)
+		hashval := hashOfIDs(file)
 		packSet := restic.IDSet{}
-		for _, blob := range blobs {
+		for _, blob := range file {
 			pack := rc.blobLookup[blob].packID
 			packSet[pack] = struct{}{}
 		}
 		rc.sPackRequires[hashval] = len(packSet)
 		for p := range packSet {
-			rc.sPackToFiles[p] = append(rc.sPackToFiles[p], fileType{blobs, hashval})
+			rc.sPackToFiles[p] = append(rc.sPackToFiles[p], fileType{file, hashval})
 		}
 	}
 
 	return nil
 }
 
-// TODO: implement jump request from saver to loader, which cascades toward downstream.
-// to achieve correct behavior, each component has to do the following:
-// saver: send new starting position to loader (blob index, starting offset) w/ ch
-// loader: just send new blob with new sequence number (increasing only)
-// iopipe: when new sequence number detected, close iopipe with specific error (NewSequenceNumber),
-//         make new iopipe, and send the new reader with new sequence number to chunker w/ ch
-// chunker: when facing NewSequenceNumber error, wait for new reader from ch, reset chunker with that reader,
-//          and send new chunks with new sequence number
-// saver: discard chunks until new sequence number arrives. In the meantime, update dstBlobs and new offset.
-//        implementation change) instead of chunk.Start, should use chunk.Length and internally tracked offsets.
 func (rc *Rechunker) RechunkData(ctx context.Context, p *progress.Counter) error {
-	numWorkers := max(runtime.GOMAXPROCS(0)-1, 1)
-	bufferPool := make(chan []byte, 4*numWorkers)
 	wgMgr, wgMgrCtx := errgroup.WithContext(ctx)
 	wgWkr, wgWkrCtx := errgroup.WithContext(ctx)
 
-	var blobGet func(blobID restic.ID, buf []byte) ([]byte, error)
-
 	// blob cache
-	rc.cache = NewRechunkBlobCache(wgMgrCtx, wgMgr, rc.blobLookup, func(packID restic.ID) (BlobData, error) {
+	cache := NewRechunkBlobCache(wgMgrCtx, wgMgr, rc.blobLookup, func(packID restic.ID) (BlobData, error) {
 		// downloadFn implementation
 		blobData := BlobData{}
-		rc.packToBlobsLock.Lock()
 		blobs := rc.packToBlobs[packID]
-		rc.packToBlobsLock.Unlock()
 		err := rc.srcRepo.LoadBlobsFromPack(wgMgrCtx, packID, blobs,
 			func(blob restic.BlobHandle, buf []byte, err error) error {
 				if err != nil {
@@ -234,9 +241,10 @@ func (rc *Rechunker) RechunkData(ctx context.Context, p *progress.Counter) error
 			}
 		}
 	})
+
 	// implement blobGet using blob cache
-	blobGet = func(blobID restic.ID, buf []byte) ([]byte, error) {
-		blob, ch := rc.cache.Get(wgWkrCtx, wgWkr, blobID, buf)
+	blobGet := func(blobID restic.ID, buf []byte) ([]byte, error) {
+		blob, ch := cache.Get(wgWkrCtx, wgWkr, blobID, buf)
 		if blob == nil { // wait for blob to be downloaded
 			select {
 			case <-wgWkrCtx.Done():
@@ -252,14 +260,14 @@ func (rc *Rechunker) RechunkData(ctx context.Context, p *progress.Counter) error
 	wgMgr.Go(func() error {
 		seenFiles := map[hashType]struct{}{}
 		ordinaryList := rc.filesList
-		priorityList := []restic.IDs{}
+		var priorityList []restic.IDs
 
 		for {
 			if len(priorityList) == 0 {
 				rc.priorityFilesListLock.Lock()
 				if len(rc.priorityFilesList) > 0 {
 					priorityList = rc.priorityFilesList
-					rc.priorityFilesList = []restic.IDs{}
+					rc.priorityFilesList = nil
 				}
 				rc.priorityFilesListLock.Unlock()
 			}
@@ -299,31 +307,9 @@ func (rc *Rechunker) RechunkData(ctx context.Context, p *progress.Counter) error
 		}
 	})
 
-	// blob tracer
-	chBlobLoaded := make(chan restic.ID, numWorkers)
-	wgMgr.Go(func() error {
-		for {
-			var id restic.ID
-			var ok bool
-			select {
-			case <-wgMgrCtx.Done():
-				return wgMgrCtx.Err()
-			case id, ok = <-chBlobLoaded:
-				if !ok { // job complete
-					return nil
-				}
-			}
-			rc.blobRequires[id]--
-			if rc.blobRequires[id] == 0 {
-				pack := rc.blobLookup[id].packID
-				rc.packToBlobsLock.Lock()
-				rc.packToBlobs[pack] = slices.DeleteFunc(rc.packToBlobs[pack], func(b restic.Blob) bool { return b.ID == id })
-				rc.packToBlobsLock.Unlock()
-			}
-		}
-	})
-
 	// rechunk workers
+	numWorkers := max(runtime.GOMAXPROCS(0)-1, 1)
+	bufferPool := make(chan []byte, 4*numWorkers)
 	for range numWorkers {
 		wgWkr.Go(func() error {
 			chnker := chunker.New(nil, rc.pol)
@@ -340,48 +326,100 @@ func (rc *Rechunker) RechunkData(ctx context.Context, p *progress.Counter) error
 					}
 				}
 				dstBlobs := restic.IDs{}
-				var srcBlobEndPos []uint
 
-				isLargeFile := len(srcBlobs) >= SMALL_FILE_THRESHOLD
-				if isLargeFile { // for larger files, use RechunkChainDict
-					srcBlobEndPos = make([]uint, len(srcBlobs))
+				chFront := make(chan chFrontType)
+				chMid := make(chan chMidType) // used only for large files
+				chBack := make(chan chBackType)
+				chJump := make(chan chJumpType, 1) // used only for large files
+				r, w := io.Pipe()
+				chnker.Reset(r, rc.pol)
+				wg, wgCtx := errgroup.WithContext(wgWkrCtx)
+
+				// preparation for large files
+				var blobPos []uint
+				var seekBlobPos func(uint, int) (int, uint)
+				var prefixPos uint
+				var prefixIdx int
+				isLargeFile := len(srcBlobs) > LARGE_FILE_THRESHOLD
+				if isLargeFile {
+					// build blobPos
+					blobPos = make([]uint, len(srcBlobs)+1)
 					var offset uint
 					for i, blob := range srcBlobs {
-						n := rc.blobLookup[blob].length
-						offset += n
-						srcBlobEndPos[i] = offset
+						offset += rc.blobLookup[blob].length
+						blobPos[i+1] = offset
+					}
+
+					// define seekBlobPos
+					seekBlobPos = func(pos uint, seekStartIdx int) (int, uint) {
+						if pos < blobPos[seekStartIdx] { // invalid position
+							return -1, 0
+						}
+						i := seekStartIdx
+						for i < len(srcBlobs) && pos >= blobPos[i+1] {
+							i++
+						}
+						offset := pos - blobPos[i]
+
+						return i, offset
+					}
+
+					// prefix match
+					prefixBlobs, numFinishedBlobs, newOffset := rc.chainDict.Get(srcBlobs, 0)
+					if prefixBlobs != nil {
+						prefixIdx = numFinishedBlobs
+						prefixPos = blobPos[numFinishedBlobs] + newOffset
+						dstBlobs = prefixBlobs
+						chJump <- chJumpType{
+							seqNum:  0,
+							blobIdx: numFinishedBlobs,
+							offset:  newOffset,
+						}
 					}
 				}
 
-				wg, wgCtx := errgroup.WithContext(wgWkrCtx)
-
 				// run loader/iopipe/chunker/saver Goroutines per each file
 				// loader: load original chunks one by one from source repo
-				chFront := make(chan []byte)
 				wg.Go(func() error {
-					for _, blobID := range srcBlobs {
+					var seqNum int
+					var offset uint
+
+				MainLoop:
+					for i := 0; i < len(srcBlobs); i++ {
+						if isLargeFile {
+							select {
+							case newPos := <-chJump:
+								seqNum = newPos.seqNum
+								i = newPos.blobIdx
+								offset = newPos.offset
+								if i >= len(srcBlobs) {
+									break MainLoop
+								}
+							default:
+							}
+						}
+
 						var buf []byte
 						select {
 						case buf = <-bufferPool:
 						default:
-							debug.Log("make buffer (1)")
 							buf = make([]byte, chunker.MaxSize)
 						}
 
-						blob, err := blobGet(blobID, buf)
+						blob, err := blobGet(srcBlobs[i], buf)
 						if err != nil {
 							return err
+						}
+						if offset != 0 {
+							copy(blob, blob[offset:])
+							blob = blob[:len(blob)-int(offset)]
+							offset = 0
 						}
 
 						select {
 						case <-wgCtx.Done():
 							return wgCtx.Err()
-						case chBlobLoaded <- blobID:
-						}
-						select {
-						case <-wgCtx.Done():
-							return wgCtx.Err()
-						case chFront <- blob:
+						case chFront <- chFrontType{seqNum, blob}:
 						}
 					}
 					close(chFront)
@@ -389,22 +427,36 @@ func (rc *Rechunker) RechunkData(ctx context.Context, p *progress.Counter) error
 				})
 
 				// iopipe: convert chunks into io.Reader stream
-				r, w := io.Pipe()
 				wg.Go(func() error {
+					var seqNum int
+
 					for {
-						var buf []byte
+						var c chFrontType
 						var ok bool
 						select {
 						case <-wgCtx.Done():
 							w.CloseWithError(wgCtx.Err())
 							return wgCtx.Err()
-						case buf, ok = <-chFront:
+						case c, ok = <-chFront:
 							if !ok { // EOF
 								w.Close()
 								return nil
 							}
 						}
 
+						if isLargeFile && c.seqNum > seqNum {
+							// new sequence
+							seqNum = c.seqNum
+							w.CloseWithError(ErrNewSequence)
+							r, w = io.Pipe()
+							select {
+							case <-ctx.Done():
+								return ctx.Err()
+							case chMid <- chMidType{seqNum, r}:
+							}
+						}
+
+						buf := c.blob
 						_, err := w.Write(buf)
 						if err != nil {
 							w.CloseWithError(err)
@@ -419,15 +471,14 @@ func (rc *Rechunker) RechunkData(ctx context.Context, p *progress.Counter) error
 				})
 
 				// chunker: rechunk filestream with destination repo's chunking parameter
-				chnker.Reset(r, rc.pol)
-				chBack := make(chan chunker.Chunk)
 				wg.Go(func() error {
+					var seqNum int
+
 					for {
 						var buf []byte
 						select {
 						case buf = <-bufferPool:
 						default:
-							debug.Log("make buffer (2)")
 							buf = make([]byte, chunker.MaxSize)
 						}
 
@@ -440,6 +491,21 @@ func (rc *Rechunker) RechunkData(ctx context.Context, p *progress.Counter) error
 							close(chBack)
 							return nil
 						}
+						if isLargeFile && err == ErrNewSequence {
+							select {
+							case bufferPool <- buf:
+							default:
+							}
+							select {
+							case <-ctx.Done():
+								return ctx.Err()
+							case newPipe := <-chMid:
+								seqNum = newPipe.seqNum
+								r = newPipe.reader
+								chnker.Reset(r, rc.pol)
+							}
+							continue
+						}
 						if err != nil {
 							r.CloseWithError(err)
 							return err
@@ -449,52 +515,62 @@ func (rc *Rechunker) RechunkData(ctx context.Context, p *progress.Counter) error
 						case <-wgCtx.Done():
 							r.CloseWithError(wgCtx.Err())
 							return wgCtx.Err()
-						case chBack <- chunk:
+						case chBack <- chBackType{seqNum, chunk}:
 						}
 					}
 				})
 
 				// saver: save rechunked blobs into destination repo
 				wg.Go(func() error {
-					var blobStartPos uint
-					idx := 0
-					eof := len(srcBlobs)
+					var seqNum int
+					var currIdx int = prefixIdx
+					var currPos uint = prefixPos
 
 					for {
-						var chunk chunker.Chunk
+						var c chBackType
 						var ok bool
 						select {
 						case <-wgCtx.Done():
 							return wgCtx.Err()
-						case chunk, ok = <-chBack:
+						case c, ok = <-chBack:
 							if !ok { // EOF
 								return nil
 							}
 						}
 
-						blobData := chunk.Data
+						if isLargeFile && c.seqNum < seqNum {
+							select {
+							case bufferPool <- c.chunk.Data:
+							default:
+							}
+							continue
+						}
+
+						blobData := c.chunk.Data
 						dstBlobID, _, _, err := rc.dstRepo.SaveBlob(ctx, restic.DataBlob, blobData, restic.ID{}, false)
 						if err != nil {
 							return err
 						}
 
 						if isLargeFile { // add chunk to chainDict
-							chunkSrcBlobs := []restic.ID{}
-							startOffset := chunk.Start - blobStartPos
-							endPos := chunk.Start + chunk.Length
-							for idx < eof && endPos <= srcBlobEndPos[idx] {
-								blobStartPos = srcBlobEndPos[idx]
-								chunkSrcBlobs = append(chunkSrcBlobs, srcBlobs[idx])
-								idx++
+							startOffset := currPos - blobPos[currIdx]
+							endPos := currPos + c.chunk.Length
+							endIdx, endOffset := seekBlobPos(endPos, currIdx)
+
+							var chunkSrcBlobs []restic.ID
+							if endIdx == len(srcBlobs) {
+								chunkSrcBlobs = append(srcBlobs[currIdx:endIdx], rc.chainDict.nullID)
+							} else {
+								chunkSrcBlobs = srcBlobs[currIdx : endIdx+1]
 							}
-							endOffset := endPos - blobStartPos
-							if endOffset > 0 {
-								chunkSrcBlobs = append(chunkSrcBlobs, srcBlobs[idx])
-							}
+
 							err := rc.chainDict.Add(chunkSrcBlobs, startOffset, endOffset, dstBlobID)
 							if err != nil {
 								return err
 							}
+
+							currPos = endPos
+							currIdx = endIdx
 						}
 
 						select {
@@ -502,6 +578,22 @@ func (rc *Rechunker) RechunkData(ctx context.Context, p *progress.Counter) error
 						default:
 						}
 						dstBlobs = append(dstBlobs, dstBlobID)
+
+						if isLargeFile { // append chunks from chainDict
+							currOffset := currPos - blobPos[currIdx]
+							appendBlobs, numFinishedBlobs, newOffset := rc.chainDict.Get(srcBlobs[currIdx:], currOffset)
+							if numFinishedBlobs > 5 { // jump only when you can jump far
+								dstBlobs = append(dstBlobs, appendBlobs...)
+								currIdx += numFinishedBlobs
+								currPos = blobPos[currIdx] + newOffset
+								seqNum++
+								chJump <- chJumpType{
+									seqNum:  seqNum,
+									blobIdx: currIdx,
+									offset:  newOffset,
+								}
+							}
+						}
 					}
 				})
 
@@ -529,8 +621,7 @@ func (rc *Rechunker) RechunkData(ctx context.Context, p *progress.Counter) error
 		return err
 	}
 	// shutdown management workers
-	rc.cache.Close()
-	close(chBlobLoaded)
+	cache.Close()
 	err = wgMgr.Wait()
 	return err
 }
