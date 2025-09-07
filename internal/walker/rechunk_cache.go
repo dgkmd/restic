@@ -21,9 +21,8 @@ type linkIndex map[uint]link
 type chainDict map[restic.ID]linkIndex
 
 type RechunkChainDict struct {
-	dict   chainDict
-	lock   sync.RWMutex
-	nullID restic.ID
+	dict chainDict
+	lock sync.RWMutex
 }
 
 func NewRechunkChainDict() *RechunkChainDict {
@@ -32,7 +31,7 @@ func NewRechunkChainDict() *RechunkChainDict {
 	}
 }
 
-func (rcd *RechunkChainDict) Get(srcBlobs restic.IDs, offset uint) (dstBlobs restic.IDs, numFinishedBlobs int, newOffset uint) {
+func (rcd *RechunkChainDict) Match(srcBlobs restic.IDs, startOffset uint) (dstBlobs restic.IDs, numFinishedBlobs int, newOffset uint) {
 	if len(srcBlobs) == 0 { // nothing to return
 		return
 	}
@@ -40,7 +39,7 @@ func (rcd *RechunkChainDict) Get(srcBlobs restic.IDs, offset uint) (dstBlobs res
 	rcd.lock.RLock()
 	defer rcd.lock.RUnlock()
 
-	lnk, ok := rcd.dict[srcBlobs[0]][offset]
+	lnk, ok := rcd.dict[srcBlobs[0]][startOffset]
 	if !ok { // dict entry not found
 		return
 	}
@@ -66,7 +65,8 @@ func (rcd *RechunkChainDict) Get(srcBlobs restic.IDs, offset uint) (dstBlobs res
 			srcBlobs = srcBlobs[1:]
 
 			if len(srcBlobs) == 0 { // reached EOF
-				lnk, ok = v[rcd.nullID]
+				var nullID restic.ID
+				lnk, ok = v[nullID]
 				if !ok {
 					return
 				}
@@ -83,7 +83,7 @@ func (rcd *RechunkChainDict) Get(srcBlobs restic.IDs, offset uint) (dstBlobs res
 	}
 }
 
-func (rcd *RechunkChainDict) Add(srcBlobs restic.IDs, startOffset, endOffset uint, dstBlob restic.ID) error {
+func (rcd *RechunkChainDict) Store(srcBlobs restic.IDs, startOffset, endOffset uint, dstBlob restic.ID) error {
 	if len(srcBlobs) == 0 {
 		return fmt.Errorf("empty srcBlobs")
 	}
@@ -166,15 +166,17 @@ type BlobData = map[restic.ID][]byte
 type RechunkBlobCache struct {
 	pcklru         PackLRU
 	packDownloadCh chan restic.ID
-	blobLookup     map[restic.ID]blobInfo
+	blobLookup     map[restic.ID]blobLookupInfo
 
 	blobs          map[restic.ID]packBlobData
 	packWaiter     map[restic.ID]chan struct{}
 	blobsLock      sync.RWMutex
 	packWaiterLock sync.Mutex
+
+	closed bool
 }
 
-func NewRechunkBlobCache(ctx context.Context, wg *errgroup.Group, blobLookup map[restic.ID]blobInfo,
+func NewRechunkBlobCache(ctx context.Context, wg *errgroup.Group, blobLookup map[restic.ID]blobLookupInfo,
 	downloadFn func(packID restic.ID) (BlobData, error), onPackReady func(packID restic.ID), onPackEvict func(packID restic.ID)) *RechunkBlobCache {
 	rbc := &RechunkBlobCache{
 		packDownloadCh: make(chan restic.ID),
@@ -304,5 +306,8 @@ func (rbc *RechunkBlobCache) Get(ctx context.Context, wg *errgroup.Group, id res
 }
 
 func (rbc *RechunkBlobCache) Close() {
-	close(rbc.packDownloadCh)
+	if !rbc.closed {
+		close(rbc.packDownloadCh)
+		rbc.closed = true
+	}
 }
