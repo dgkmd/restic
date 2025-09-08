@@ -108,9 +108,8 @@ func (rcd *RechunkChainDict) Store(srcBlobs restic.IDs, startOffset, endOffset u
 		if singleTerminalLink {
 			_ = lnk.(terminalLink)
 			return nil // nothing to touch
-		} else {
-			_ = lnk.(continuedLink)
 		}
+		_ = lnk.(continuedLink)
 	} else { // index does not exist
 		if singleTerminalLink {
 			idx[startOffset] = terminalLink{
@@ -118,10 +117,9 @@ func (rcd *RechunkChainDict) Store(srcBlobs restic.IDs, startOffset, endOffset u
 				offset:  endOffset,
 			}
 			return nil
-		} else {
-			idx[startOffset] = continuedLink{}
-			lnk = idx[startOffset]
 		}
+		idx[startOffset] = continuedLink{}
+		lnk = idx[startOffset]
 	}
 	srcBlobs = srcBlobs[1:]
 

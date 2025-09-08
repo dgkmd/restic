@@ -51,8 +51,6 @@ func TestRechunkerRechunkData(t *testing.T) {
 
 	tempDir := rtest.TempDir(t)
 	archiver.TestCreateFiles(t, tempDir, src)
-	src = nil
-	dupFileContent = ""
 
 	// archive data to the repos with archiver
 	srcSn := archiver.TestSnapshot(t, srcRepo, tempDir, nil)
@@ -62,17 +60,26 @@ func TestRechunkerRechunkData(t *testing.T) {
 	rechunker := NewRechunker(srcRepo, dstTestsRepo)
 	wg, wgCtx := errgroup.WithContext(ctx)
 	dstTestsRepo.StartPackUploader(wgCtx, wg)
-	rechunker.Plan(ctx, []restic.ID{*srcSn.Tree})
-	rechunker.RechunkData(ctx, nil)
-	dstTestsRepo.Flush(ctx)
+	if err := rechunker.Plan(ctx, []restic.ID{*srcSn.Tree}); err != nil {
+		panic(err)
+	}
+	if err := rechunker.RechunkData(ctx, nil); err != nil {
+		panic(err)
+	}
+	if err := dstTestsRepo.Flush(ctx); err != nil {
+		panic(err)
+	}
 
 	// compare data blobs between dstWantsRepo and dstTestRepo
 	blobWants := restic.IDs{}
-	dstWantsRepo.ListBlobs(ctx, func(pb restic.PackedBlob) {
+	err := dstWantsRepo.ListBlobs(ctx, func(pb restic.PackedBlob) {
 		if pb.Type == restic.DataBlob {
 			blobWants = append(blobWants, pb.ID)
 		}
 	})
+	if err != nil {
+		panic(err)
+	}
 
 	for _, blobID := range blobWants {
 		_, ok := dstTestsRepo.LookupBlobSize(restic.DataBlob, blobID)

@@ -25,19 +25,19 @@ type blobLookupInfo struct {
 	packID     restic.ID
 }
 
-type chFrontType struct {
+type srcChunk struct {
 	seqNum int
 	blob   []byte
 }
-type chMidType struct {
+type newPipeSpec struct {
 	seqNum int
 	reader *io.PipeReader
 }
-type chBackType struct {
+type dstChunk struct {
 	seqNum int
 	chunk  chunker.Chunk
 }
-type chJumpType struct {
+type jumpOrder struct {
 	seqNum  int
 	blobIdx int
 	offset  uint
@@ -84,7 +84,7 @@ func NewRechunker(srcRepo restic.Repository, dstRepo restic.Repository) *Rechunk
 	}
 }
 
-const SMALL_FILE_THRESHOLD = 25
+const SMALL_FILE_THRESHOLD = 50
 const LARGE_FILE_THRESHOLD = 50
 
 func (rc *Rechunker) Reset() {
@@ -119,7 +119,7 @@ func (rc *Rechunker) Plan(ctx context.Context, roots []restic.ID) error {
 		return visited
 	}, nil)
 
-	// gather all unique file Contents under trees
+	// gather all distinct file Contents under trees
 	wg.Go(func() error {
 		for tree := range treeStream {
 			if tree.Error != nil {
@@ -170,7 +170,7 @@ func (rc *Rechunker) Plan(ctx context.Context, roots []restic.ID) error {
 
 	// build pack<->file metadata for small files
 	for _, file := range rc.filesList {
-		if len(file) >= SMALL_FILE_THRESHOLD {
+		if len(file) > SMALL_FILE_THRESHOLD {
 			continue
 		}
 		hashval := hashOfIDs(file)
@@ -342,15 +342,15 @@ func (rc *Rechunker) RechunkData(ctx context.Context, p *progress.Counter) error
 				}
 				dstBlobs := restic.IDs{}
 
-				chFront := make(chan chFrontType)
-				chMid := make(chan chMidType) // used only for large files
-				chBack := make(chan chBackType)
-				chJump := make(chan chJumpType, 1) // used only for large files
+				chSrcChunk := make(chan srcChunk)
+				chNewPipe := make(chan newPipeSpec) // used only if useChainDict
+				chDstChunk := make(chan dstChunk)
+				chJumpOrder := make(chan jumpOrder, 1) // used only if useChainDict
 				r, w := io.Pipe()
 				chnker.Reset(r, rc.pol)
 				wg, wgCtx := errgroup.WithContext(wgWkrCtx)
 
-				// prepare variables for large files
+				// prepare variables for chainDict
 				var blobPos []uint
 				var seekBlobPos func(uint, int) (int, uint)
 				var prefixPos uint
@@ -386,7 +386,7 @@ func (rc *Rechunker) RechunkData(ctx context.Context, p *progress.Counter) error
 						prefixPos = blobPos[numFinishedBlobs] + newOffset
 						dstBlobs = prefixBlobs
 
-						chJump <- chJumpType{
+						chJumpOrder <- jumpOrder{
 							seqNum:  0,
 							blobIdx: numFinishedBlobs,
 							offset:  newOffset,
@@ -397,14 +397,14 @@ func (rc *Rechunker) RechunkData(ctx context.Context, p *progress.Counter) error
 				// run loader/iopipe/chunker/saver Goroutines per each file
 				// loader: load original chunks one by one from source repo
 				wg.Go(func() error {
-					var seqNum int
-					var offset uint
+					var seqNum int  // used only if useChainDict
+					var offset uint // used only if useChainDict
 
 				MainLoop:
 					for i := 0; i < len(srcBlobs); i++ {
 						if useChainDict {
 							select {
-							case newPos := <-chJump:
+							case newPos := <-chJumpOrder:
 								seqNum = newPos.seqNum
 								i = newPos.blobIdx
 								offset = newPos.offset
@@ -426,7 +426,7 @@ func (rc *Rechunker) RechunkData(ctx context.Context, p *progress.Counter) error
 						if err != nil {
 							return err
 						}
-						if offset != 0 {
+						if useChainDict && offset != 0 {
 							copy(blob, blob[offset:])
 							blob = blob[:len(blob)-int(offset)]
 							offset = 0
@@ -435,28 +435,28 @@ func (rc *Rechunker) RechunkData(ctx context.Context, p *progress.Counter) error
 						select {
 						case <-wgCtx.Done():
 							return wgCtx.Err()
-						case chFront <- chFrontType{seqNum, blob}:
+						case chSrcChunk <- srcChunk{seqNum, blob}:
 						}
 					}
-					close(chFront)
+					close(chSrcChunk)
 					return nil
 				})
 
 				// iopipe: convert chunks into io.Reader stream
 				wg.Go(func() error {
-					var seqNum int
+					var seqNum int // used only if useChainDict
 
 					for {
-						var c chFrontType
+						var c srcChunk
 						var ok bool
 						select {
 						case <-wgCtx.Done():
 							w.CloseWithError(wgCtx.Err())
 							return wgCtx.Err()
-						case c, ok = <-chFront:
+						case c, ok = <-chSrcChunk:
 							if !ok { // EOF
-								w.Close()
-								return nil
+								err := w.Close()
+								return err
 							}
 						}
 
@@ -468,7 +468,7 @@ func (rc *Rechunker) RechunkData(ctx context.Context, p *progress.Counter) error
 							select {
 							case <-wgCtx.Done():
 								return wgCtx.Err()
-							case chMid <- chMidType{seqNum, r}:
+							case chNewPipe <- newPipeSpec{seqNum, r}:
 							}
 						}
 
@@ -488,7 +488,7 @@ func (rc *Rechunker) RechunkData(ctx context.Context, p *progress.Counter) error
 
 				// chunker: rechunk filestream with destination repo's chunking parameter
 				wg.Go(func() error {
-					var seqNum int
+					var seqNum int // used only if useChainDict
 
 					for {
 						var buf []byte
@@ -504,7 +504,7 @@ func (rc *Rechunker) RechunkData(ctx context.Context, p *progress.Counter) error
 							case bufferPool <- buf:
 							default:
 							}
-							close(chBack)
+							close(chDstChunk)
 							return nil
 						}
 						if useChainDict && err == ErrNewSequence {
@@ -515,7 +515,7 @@ func (rc *Rechunker) RechunkData(ctx context.Context, p *progress.Counter) error
 							select {
 							case <-wgCtx.Done():
 								return wgCtx.Err()
-							case newPipe := <-chMid:
+							case newPipe := <-chNewPipe:
 								seqNum = newPipe.seqNum
 								r = newPipe.reader
 								chnker.Reset(r, rc.pol)
@@ -531,31 +531,31 @@ func (rc *Rechunker) RechunkData(ctx context.Context, p *progress.Counter) error
 						case <-wgCtx.Done():
 							r.CloseWithError(wgCtx.Err())
 							return wgCtx.Err()
-						case chBack <- chBackType{seqNum, chunk}:
+						case chDstChunk <- dstChunk{seqNum, chunk}:
 						}
 					}
 				})
 
 				// saver: save rechunked blobs into destination repo
 				wg.Go(func() error {
-					var seqNum int
-					var currIdx int = prefixIdx
-					var currPos uint = prefixPos
+					var seqNum int       // used only if useChainDict
+					currIdx := prefixIdx // used only if useChainDict
+					currPos := prefixPos // used only if useChainDict
 
 					for {
-						var c chBackType
+						var c dstChunk
 						var ok bool
 						select {
 						case <-wgCtx.Done():
 							return wgCtx.Err()
-						case c, ok = <-chBack:
+						case c, ok = <-chDstChunk:
 							if !ok { // EOF
 								return nil
 							}
 						}
 
 						if useChainDict && c.seqNum < seqNum {
-							// this chunk is skipped by previous chainDict match, so just continue to next chunk
+							// this chunk is skipped by previous chainDict match, so just throw it away and continue to next chunk
 							select {
 							case bufferPool <- c.chunk.Data:
 							default:
@@ -597,17 +597,17 @@ func (rc *Rechunker) RechunkData(ctx context.Context, p *progress.Counter) error
 						}
 						dstBlobs = append(dstBlobs, dstBlobID)
 
-						if useChainDict { // append chunks from chainDict
+						if useChainDict { // match chunks from chainDict and append them
 							currOffset := currPos - blobPos[currIdx]
-							appendBlobs, numFinishedBlobs, newOffset := rc.chainDict.Match(srcBlobs[currIdx:], currOffset)
-							if numFinishedBlobs > 4 { // apply only when you can skip many blobs; otherwise, it would be better not to interrupt the pipeline
-								dstBlobs = append(dstBlobs, appendBlobs...)
+							matchedDstBlobs, numFinishedSrcBlobs, newOffset := rc.chainDict.Match(srcBlobs[currIdx:], currOffset)
+							if numFinishedSrcBlobs > 4 { // apply only when you can skip many blobs; otherwise, it would be better not to interrupt the pipeline
+								dstBlobs = append(dstBlobs, matchedDstBlobs...)
 
-								currIdx += numFinishedBlobs
+								currIdx += numFinishedSrcBlobs
 								currPos = blobPos[currIdx] + newOffset
 
 								seqNum++
-								chJump <- chJumpType{
+								chJumpOrder <- jumpOrder{
 									seqNum:  seqNum,
 									blobIdx: currIdx,
 									offset:  newOffset,
