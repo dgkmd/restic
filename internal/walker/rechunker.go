@@ -57,18 +57,19 @@ type Rechunker struct {
 	// read-only once built
 	filesList    []restic.IDs
 	blobLookup   map[restic.ID]blobLookupInfo
+	sPackToFiles map[restic.ID][]fileType
 	rechunkReady bool
 
 	// RW by dedicated worker
-	blobRequires  map[restic.ID]int
-	sPackRequires map[hashType]int
-	sPackToFiles  map[restic.ID][]fileType
+	blobRequires map[restic.ID]int // how many times a blob is required by (remaining) files
 
 	// concurrently accessed across workers
-	rechunkMap      map[hashType]restic.IDs
-	packToBlobs     map[restic.ID][]restic.Blob
-	rechunkMapLock  sync.Mutex
-	packToBlobsLock sync.Mutex
+	rechunkMap        map[hashType]restic.IDs
+	packToBlobs       map[restic.ID][]restic.Blob // which blobs should be loaded from a pack
+	sPackRequires     map[hashType]int            // how many more packs to download for a file to be reconstructed
+	rechunkMapLock    sync.Mutex
+	packToBlobsLock   sync.RWMutex
+	sPackRequiresLock sync.Mutex
 
 	// used in RewriteTree
 	rewriteTreeMap map[restic.ID]restic.ID
@@ -93,11 +94,11 @@ const LARGE_FILE_THRESHOLD = 50
 func (rc *Rechunker) Reset() {
 	rc.filesList = nil
 	rc.blobLookup = map[restic.ID]blobLookupInfo{}
+	rc.sPackToFiles = map[restic.ID][]fileType{}
 	rc.rechunkReady = false
 
 	rc.blobRequires = map[restic.ID]int{}
 	rc.sPackRequires = map[hashType]int{}
-	rc.sPackToFiles = map[restic.ID][]fileType{}
 
 	rc.packToBlobs = map[restic.ID][]restic.Blob{}
 }
@@ -203,16 +204,17 @@ func (rc *Rechunker) RechunkData(ctx context.Context, p *progress.Counter) error
 	wgWkr, wgWkrCtx := errgroup.WithContext(ctx)
 
 	numWorkers := max(runtime.GOMAXPROCS(0)-1, 1)
+	numDownloaders := max(numWorkers/4, 1)
 	var priorityFilesList []restic.IDs
 	var priorityFilesListLock sync.Mutex
 
 	// blob cache
-	cache := NewRechunkBlobCache(wgMgrCtx, wgMgr, rc.blobLookup, func(packID restic.ID) (BlobData, error) {
+	cache := NewRechunkBlobCache(wgMgrCtx, wgMgr, rc.blobLookup, numDownloaders, func(packID restic.ID) (BlobData, error) {
 		// downloadFn implementation
 		blobData := BlobData{}
-		rc.packToBlobsLock.Lock()
+		rc.packToBlobsLock.RLock()
 		blobs := rc.packToBlobs[packID]
-		rc.packToBlobsLock.Unlock()
+		rc.packToBlobsLock.RUnlock()
 		err := rc.srcRepo.LoadBlobsFromPack(wgMgrCtx, packID, blobs,
 			func(blob restic.BlobHandle, buf []byte, err error) error {
 				if err != nil {
@@ -230,31 +232,34 @@ func (rc *Rechunker) RechunkData(ctx context.Context, p *progress.Counter) error
 		return blobData, nil
 	}, func(packID restic.ID) {
 		// onPackReady implementation
-		files := rc.sPackToFiles[packID]
-		for _, file := range files {
+		filesToUpdate := rc.sPackToFiles[packID]
+		var readyFiles []restic.IDs
+
+		rc.sPackRequiresLock.Lock()
+		for _, file := range filesToUpdate {
 			if rc.sPackRequires[file.hashval] > 0 {
 				rc.sPackRequires[file.hashval]--
 				if rc.sPackRequires[file.hashval] == 0 {
-					priorityFilesListLock.Lock()
-					priorityFilesList = append(priorityFilesList, file.IDs)
-					priorityFilesListLock.Unlock()
+					readyFiles = append(readyFiles, file.IDs)
 				}
 			}
 		}
+		rc.sPackRequiresLock.Unlock()
+
+		priorityFilesListLock.Lock()
+		priorityFilesList = append(priorityFilesList, readyFiles...)
+		priorityFilesListLock.Unlock()
 	}, func(packID restic.ID) {
 		// onPackEvict implementation
-		files := rc.sPackToFiles[packID]
-		file_remaining := false
-		for _, file := range files {
-			// files with sPackRequires==0 has already gone to priorityFilesList, so ignore them
+		filesToUpdate := rc.sPackToFiles[packID]
+		rc.sPackRequiresLock.Lock()
+		for _, file := range filesToUpdate {
+			// files with sPackRequires==0 has already gone to priorityFilesList, so don't track them
 			if rc.sPackRequires[file.hashval] > 0 {
 				rc.sPackRequires[file.hashval]++
-				file_remaining = true
-			}
-			if !file_remaining {
-				rc.sPackToFiles[packID] = []fileType{}
 			}
 		}
+		rc.sPackRequiresLock.Unlock()
 	})
 
 	// implement blobGet using blob cache
