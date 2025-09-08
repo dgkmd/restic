@@ -7,7 +7,6 @@ import (
 	"fmt"
 	"io"
 	"runtime"
-	"slices"
 	"sync"
 
 	"github.com/restic/chunker"
@@ -60,9 +59,6 @@ type Rechunker struct {
 	sPackToFiles map[restic.ID][]fileType
 	rechunkReady bool
 
-	// RW by dedicated worker
-	blobRequires map[restic.ID]int // how many times a blob is required by (remaining) files
-
 	// concurrently accessed across workers
 	rechunkMap        map[hashType]restic.IDs
 	packToBlobs       map[restic.ID][]restic.Blob // which blobs should be loaded from a pack
@@ -97,7 +93,6 @@ func (rc *Rechunker) Reset() {
 	rc.sPackToFiles = map[restic.ID][]fileType{}
 	rc.rechunkReady = false
 
-	rc.blobRequires = map[restic.ID]int{}
 	rc.sPackRequires = map[hashType]int{}
 
 	rc.packToBlobs = map[restic.ID][]restic.Blob{}
@@ -150,15 +145,16 @@ func (rc *Rechunker) Plan(ctx context.Context, roots []restic.ID) error {
 		return err
 	}
 
-	// count how many times each blob is needed
+	// collect all required blobs
+	allBlobs := restic.IDSet{}
 	for _, file := range rc.filesList {
 		for _, blob := range file {
-			rc.blobRequires[blob]++
+			allBlobs.Insert(blob)
 		}
 	}
 
 	// build pack<->blob map
-	for blob := range rc.blobRequires {
+	for blob := range allBlobs {
 		packs := rc.srcRepo.LookupBlob(restic.DataBlob, blob)
 		if len(packs) == 0 {
 			return fmt.Errorf("can't find blob from source repo: %v", blob)
@@ -327,48 +323,6 @@ func (rc *Rechunker) RechunkData(ctx context.Context, p *progress.Counter) error
 		}
 	})
 
-	// blob tracer
-	chCompletedBlobs := make(chan restic.IDs, numWorkers)
-	wgMgr.Go(func() error {
-		for {
-			var blobs restic.IDs
-			var ok bool
-			select {
-			case <-wgMgrCtx.Done():
-				return wgMgrCtx.Err()
-			case blobs, ok = <-chCompletedBlobs:
-				if !ok {
-					return nil
-				}
-			}
-
-			doneBlobs := restic.IDSet{}
-			for _, blob := range blobs {
-				rc.blobRequires[blob]--
-				if rc.blobRequires[blob] == 0 {
-					doneBlobs.Insert(blob)
-				}
-			}
-
-			if len(doneBlobs) > 0 {
-				packsToUpdate := restic.IDSet{}
-				for blob := range doneBlobs {
-					pack := rc.blobLookup[blob].packID
-					packsToUpdate.Insert(pack)
-				}
-
-				rc.packToBlobsLock.Lock()
-				for pack := range packsToUpdate {
-					rc.packToBlobs[pack] = slices.DeleteFunc(rc.packToBlobs[pack], func(b restic.Blob) bool {
-						_, ok := doneBlobs[b.ID]
-						return ok
-					})
-				}
-				rc.packToBlobsLock.Unlock()
-			}
-		}
-	})
-
 	// rechunk workers
 	bufferPool := make(chan []byte, 4*numWorkers)
 	for range numWorkers {
@@ -436,14 +390,6 @@ func (rc *Rechunker) RechunkData(ctx context.Context, p *progress.Counter) error
 							seqNum:  0,
 							blobIdx: numFinishedBlobs,
 							offset:  newOffset,
-						}
-
-						if numFinishedBlobs > 0 {
-							select {
-							case <-wgCtx.Done():
-								return wgCtx.Err()
-							case chCompletedBlobs <- srcBlobs[0:numFinishedBlobs]:
-							}
 						}
 					}
 				}
@@ -657,12 +603,6 @@ func (rc *Rechunker) RechunkData(ctx context.Context, p *progress.Counter) error
 							if numFinishedBlobs > 4 { // apply only when you can skip many blobs; otherwise, it would be better not to interrupt the pipeline
 								dstBlobs = append(dstBlobs, appendBlobs...)
 
-								select {
-								case <-wgCtx.Done():
-									return wgCtx.Err()
-								case chCompletedBlobs <- srcBlobs[currIdx : currIdx+numFinishedBlobs]:
-								}
-
 								currIdx += numFinishedBlobs
 								currPos = blobPos[currIdx] + newOffset
 
@@ -702,7 +642,6 @@ func (rc *Rechunker) RechunkData(ctx context.Context, p *progress.Counter) error
 	}
 	// shutdown management workers
 	cache.Close()
-	close(chCompletedBlobs)
 	err = wgMgr.Wait()
 	return err
 }
