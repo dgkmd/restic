@@ -43,41 +43,37 @@ type jumpOrder struct {
 	offset  uint
 }
 
+type PackBlobLoader interface {
+	LoadBlobsFromPack(ctx context.Context, packID restic.ID, blobs []restic.Blob, handleBlobFn func(blob restic.BlobHandle, buf []byte, err error) error) error
+}
+
 var ErrNewSequence = errors.New("new sequence")
 
 type Rechunker struct {
-	srcRepo    restic.Repository
-	dstRepo    restic.Repository
-	pol        chunker.Pol
-	blobLoader restic.BlobLoader
-	blobSaver  restic.BlobSaver
-	chainDict  *RechunkChainDict
+	pol       chunker.Pol
+	chainDict *RechunkChainDict
 
 	// read-only once built
 	filesList    []restic.IDs
-	blobLookup   map[restic.ID]blobLookupInfo
-	sPackToFiles map[restic.ID][]fileType
+	blobLookup   map[restic.ID]blobLookupInfo // blob ID -> {blob length, pack ID}
+	sPackToFiles map[restic.ID][]fileType     // pack ID -> list of files{blob IDs, hashOfIDs} that contains any blob in the pack
 	rechunkReady bool
 
 	// concurrently accessed across workers
-	rechunkMap        map[hashType]restic.IDs
-	packToBlobs       map[restic.ID][]restic.Blob // which blobs should be loaded from a pack
-	sPackRequires     map[hashType]int            // how many more packs to download for a file to be reconstructed
+	rechunkMap        map[hashType]restic.IDs     // hashOfIDs of src blob IDs -> dst blob IDs
+	packToBlobs       map[restic.ID][]restic.Blob // pack ID -> list of blobs to be loaded from the pack
+	sPackRequires     map[hashType]int            // hashOfIDs -> number of packs until all blobs in the cache
 	rechunkMapLock    sync.Mutex
 	packToBlobsLock   sync.RWMutex
 	sPackRequiresLock sync.Mutex
 
 	// used in RewriteTree
-	rewriteTreeMap map[restic.ID]restic.ID
+	rewriteTreeMap map[restic.ID]restic.ID // original tree ID -> rewritten tree ID
 }
 
-func NewRechunker(srcRepo restic.Repository, dstRepo restic.Repository) *Rechunker {
+func NewRechunker(pol chunker.Pol) *Rechunker {
 	return &Rechunker{
-		srcRepo:        srcRepo,
-		dstRepo:        dstRepo,
-		pol:            dstRepo.Config().ChunkerPolynomial,
-		blobLoader:     srcRepo,
-		blobSaver:      dstRepo,
+		pol:            pol,
 		chainDict:      NewRechunkChainDict(),
 		rechunkMap:     map[hashType]restic.IDs{},
 		rewriteTreeMap: map[restic.ID]restic.ID{},
@@ -87,7 +83,7 @@ func NewRechunker(srcRepo restic.Repository, dstRepo restic.Repository) *Rechunk
 const SMALL_FILE_THRESHOLD = 50
 const LARGE_FILE_THRESHOLD = 50
 
-func (rc *Rechunker) Reset() {
+func (rc *Rechunker) reset() {
 	rc.filesList = nil
 	rc.blobLookup = map[restic.ID]blobLookupInfo{}
 	rc.sPackToFiles = map[restic.ID][]fileType{}
@@ -98,8 +94,52 @@ func (rc *Rechunker) Reset() {
 	rc.packToBlobs = map[restic.ID][]restic.Blob{}
 }
 
-func (rc *Rechunker) Plan(ctx context.Context, roots []restic.ID) error {
-	rc.Reset()
+func (rc *Rechunker) buildIndex(lookupBlobFn func(t restic.BlobType, id restic.ID) []restic.PackedBlob) error {
+	// collect all required blobs
+	allBlobs := restic.IDSet{}
+	for _, file := range rc.filesList {
+		for _, blob := range file {
+			allBlobs.Insert(blob)
+		}
+	}
+
+	// build pack<->blob map
+	for blob := range allBlobs {
+		packs := lookupBlobFn(restic.DataBlob, blob)
+		if len(packs) == 0 {
+			return fmt.Errorf("can't find blob from source repo: %v", blob)
+		}
+		pb := packs[0]
+
+		rc.packToBlobs[pb.PackID] = append(rc.packToBlobs[pb.PackID], pb.Blob)
+		rc.blobLookup[pb.Blob.ID] = blobLookupInfo{
+			dataLength: pb.DataLength(),
+			packID:     pb.PackID,
+		}
+	}
+
+	// build pack<->file metadata for small files
+	for _, file := range rc.filesList {
+		if len(file) > SMALL_FILE_THRESHOLD {
+			continue
+		}
+		hashval := hashOfIDs(file)
+		packSet := restic.IDSet{}
+		for _, blob := range file {
+			pack := rc.blobLookup[blob].packID
+			packSet.Insert(pack)
+		}
+		rc.sPackRequires[hashval] = len(packSet)
+		for p := range packSet {
+			rc.sPackToFiles[p] = append(rc.sPackToFiles[p], fileType{file, hashval})
+		}
+	}
+
+	return nil
+}
+
+func (rc *Rechunker) Plan(ctx context.Context, srcRepo restic.Repository, roots []restic.ID) error {
+	rc.reset()
 
 	visitedFiles := map[hashType]struct{}{}
 	visitedTrees := restic.IDSet{}
@@ -113,7 +153,7 @@ func (rc *Rechunker) Plan(ctx context.Context, roots []restic.ID) error {
 	}
 
 	wg, wgCtx := errgroup.WithContext(ctx)
-	treeStream := restic.StreamTrees(wgCtx, wg, rc.srcRepo, roots, func(id restic.ID) bool {
+	treeStream := restic.StreamTrees(wgCtx, wg, srcRepo, roots, func(id restic.ID) bool {
 		visited := visitedTrees.Has(id)
 		visitedTrees.Insert(id)
 		return visited
@@ -145,44 +185,9 @@ func (rc *Rechunker) Plan(ctx context.Context, roots []restic.ID) error {
 		return err
 	}
 
-	// collect all required blobs
-	allBlobs := restic.IDSet{}
-	for _, file := range rc.filesList {
-		for _, blob := range file {
-			allBlobs.Insert(blob)
-		}
-	}
-
-	// build pack<->blob map
-	for blob := range allBlobs {
-		packs := rc.srcRepo.LookupBlob(restic.DataBlob, blob)
-		if len(packs) == 0 {
-			return fmt.Errorf("can't find blob from source repo: %v", blob)
-		}
-		pb := packs[0]
-
-		rc.packToBlobs[pb.PackID] = append(rc.packToBlobs[pb.PackID], pb.Blob)
-		rc.blobLookup[pb.Blob.ID] = blobLookupInfo{
-			dataLength: pb.DataLength(),
-			packID:     pb.PackID,
-		}
-	}
-
-	// build pack<->file metadata for small files
-	for _, file := range rc.filesList {
-		if len(file) > SMALL_FILE_THRESHOLD {
-			continue
-		}
-		hashval := hashOfIDs(file)
-		packSet := restic.IDSet{}
-		for _, blob := range file {
-			pack := rc.blobLookup[blob].packID
-			packSet[pack] = struct{}{}
-		}
-		rc.sPackRequires[hashval] = len(packSet)
-		for p := range packSet {
-			rc.sPackToFiles[p] = append(rc.sPackToFiles[p], fileType{file, hashval})
-		}
+	err = rc.buildIndex(srcRepo.LookupBlob)
+	if err != nil {
+		return err
 	}
 
 	rc.rechunkReady = true
@@ -190,7 +195,7 @@ func (rc *Rechunker) Plan(ctx context.Context, roots []restic.ID) error {
 	return nil
 }
 
-func (rc *Rechunker) RechunkData(ctx context.Context, p *progress.Counter) error {
+func (rc *Rechunker) RechunkData(ctx context.Context, srcRepo PackBlobLoader, dstRepo restic.BlobSaver, p *progress.Counter) error {
 	if !rc.rechunkReady {
 		return fmt.Errorf("Plan() must be run first before RechunkData()")
 	}
@@ -211,7 +216,7 @@ func (rc *Rechunker) RechunkData(ctx context.Context, p *progress.Counter) error
 		rc.packToBlobsLock.RLock()
 		blobs := rc.packToBlobs[packID]
 		rc.packToBlobsLock.RUnlock()
-		err := rc.srcRepo.LoadBlobsFromPack(wgMgrCtx, packID, blobs,
+		err := srcRepo.LoadBlobsFromPack(wgMgrCtx, packID, blobs,
 			func(blob restic.BlobHandle, buf []byte, err error) error {
 				if err != nil {
 					return err
@@ -564,7 +569,7 @@ func (rc *Rechunker) RechunkData(ctx context.Context, p *progress.Counter) error
 						}
 
 						blobData := c.chunk.Data
-						dstBlobID, _, _, err := rc.dstRepo.SaveBlob(ctx, restic.DataBlob, blobData, restic.ID{}, false)
+						dstBlobID, _, _, err := dstRepo.SaveBlob(ctx, restic.DataBlob, blobData, restic.ID{}, false)
 						if err != nil {
 							return err
 						}
@@ -660,14 +665,14 @@ func (rc *Rechunker) rewriteNode(node *restic.Node) error {
 	return nil
 }
 
-func (rc *Rechunker) RewriteTree(ctx context.Context, nodeID restic.ID) (restic.ID, error) {
+func (rc *Rechunker) RewriteTree(ctx context.Context, srcRepo restic.BlobLoader, dstRepo restic.BlobSaver, nodeID restic.ID) (restic.ID, error) {
 	// check if the identical tree has already been processed
 	newID, ok := rc.rewriteTreeMap[nodeID]
 	if ok {
 		return newID, nil
 	}
 
-	curTree, err := restic.LoadTree(ctx, rc.blobLoader, nodeID)
+	curTree, err := restic.LoadTree(ctx, srcRepo, nodeID)
 	if err != nil {
 		return restic.ID{}, err
 	}
@@ -692,7 +697,7 @@ func (rc *Rechunker) RewriteTree(ctx context.Context, nodeID restic.ID) (restic.
 		}
 
 		subtree := *node.Subtree
-		newID, err := rc.RewriteTree(ctx, subtree)
+		newID, err := rc.RewriteTree(ctx, srcRepo, dstRepo, subtree)
 		if err != nil {
 			return restic.ID{}, err
 		}
@@ -709,7 +714,7 @@ func (rc *Rechunker) RewriteTree(ctx context.Context, nodeID restic.ID) (restic.
 	}
 
 	// Save new tree
-	newTreeID, _, _, err := rc.blobSaver.SaveBlob(ctx, restic.TreeBlob, tree, restic.ID{}, false)
+	newTreeID, _, _, err := dstRepo.SaveBlob(ctx, restic.TreeBlob, tree, restic.ID{}, false)
 	rc.rewriteTreeMap[nodeID] = newTreeID
 	return newTreeID, err
 }

@@ -123,7 +123,7 @@ func runRechunkCopy(ctx context.Context, opts RechunkCopyOptions, gopts GlobalOp
 		return ctx.Err()
 	}
 
-	rechunker := walker.NewRechunker(srcRepo, dstRepo)
+	rechunker := walker.NewRechunker(dstRepo.Config().ChunkerPolynomial)
 	rootTrees := []restic.ID{}
 
 	// first pass: gather all root trees of snapshots for rechunking
@@ -154,7 +154,7 @@ func runRechunkCopy(ctx context.Context, opts RechunkCopyOptions, gopts GlobalOp
 
 	wg, wgCtx := errgroup.WithContext(ctx)
 	dstRepo.StartPackUploader(wgCtx, wg)
-	if err = runRechunk(ctx, rootTrees, rechunker, gopts.Quiet); err != nil {
+	if err = runRechunk(ctx, srcRepo, rootTrees, dstRepo, rechunker, gopts.Quiet); err != nil {
 		return err
 	}
 
@@ -182,7 +182,7 @@ func runRechunkCopy(ctx context.Context, opts RechunkCopyOptions, gopts GlobalOp
 			}
 		}
 
-		_, err := rechunker.RewriteTree(ctx, *sn.Tree)
+		_, err := rechunker.RewriteTree(ctx, srcRepo, dstRepo, *sn.Tree)
 		if err != nil {
 			return err
 		}
@@ -241,16 +241,16 @@ func runRechunkCopy(ctx context.Context, opts RechunkCopyOptions, gopts GlobalOp
 	return ctx.Err()
 }
 
-func runRechunk(ctx context.Context, roots []restic.ID, rechunker *walker.Rechunker, quiet bool) error {
+func runRechunk(ctx context.Context, srcRepo restic.Repository, roots []restic.ID, dstRepo restic.Repository, rechunker *walker.Rechunker, quiet bool) error {
 	Verbosef("Rechunk scheduling start...\n")
-	err := rechunker.Plan(ctx, roots)
+	err := rechunker.Plan(ctx, srcRepo, roots)
 	if err != nil {
 		return err
 	}
 	Verbosef("Scheduling Done. Rechunking data...\n")
 
 	bar := newProgressMax(!quiet, uint64(rechunker.NumFilesToProcess()), "distinct files rechunked")
-	err = rechunker.RechunkData(ctx, bar)
+	err = rechunker.RechunkData(ctx, srcRepo, dstRepo, bar)
 	if err != nil {
 		return err
 	}

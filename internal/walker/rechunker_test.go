@@ -1,90 +1,156 @@
 package walker
 
 import (
+	"bytes"
 	"context"
 	"fmt"
+	"io"
 	"sort"
 	"testing"
-
-	"golang.org/x/sync/errgroup"
 
 	"github.com/restic/chunker"
 
 	"github.com/restic/restic/internal/restic"
 	rtest "github.com/restic/restic/internal/test"
-
 	// borrowing test fixtures from following packages
-	"github.com/restic/restic/internal/archiver"
-	"github.com/restic/restic/internal/repository"
 )
 
 // Reference: walker_test.go, rewriter_test.go (v0.18.0)
 
+// three tests: RechunkData integrity, RewriteTree integrity, all workflow running normally
+
+type TestRechunkerRepo struct {
+	loadBlobsFromPack func(packID restic.ID, blobs []restic.Blob, handleBlobFn func(blob restic.BlobHandle, buf []byte, err error) error) error
+	saveBlob          func(buf []byte) (newID restic.ID, known bool, size int, err error)
+}
+
+func (trr *TestRechunkerRepo) LoadBlobsFromPack(ctx context.Context, packID restic.ID, blobs []restic.Blob, handleBlobFn func(blob restic.BlobHandle, buf []byte, err error) error) error {
+	return trr.loadBlobsFromPack(packID, blobs, handleBlobFn)
+}
+func (trr *TestRechunkerRepo) SaveBlob(ctx context.Context, t restic.BlobType, buf []byte, id restic.ID, storeDuplicate bool) (newID restic.ID, known bool, size int, err error) {
+	return trr.saveBlob(buf)
+}
+
+func chunkFiles(chnker *chunker.Chunker, pol chunker.Pol, files map[string][]byte) (map[string]restic.IDs, map[restic.ID][]byte) {
+	chunkedFiles := map[string]restic.IDs{}
+	blobStore := map[restic.ID][]byte{}
+
+	for name, data := range files {
+		r := bytes.NewReader(data)
+		chnker.Reset(r, pol)
+		chunks := restic.IDs{}
+
+		for {
+			chunk, err := chnker.Next(nil)
+			if err == io.EOF {
+				break
+			}
+			if err != nil {
+				panic(err)
+			}
+
+			id := restic.Hash(chunk.Data)
+			chunks = append(chunks, id)
+			if _, ok := blobStore[id]; !ok {
+				blobStore[id] = chunk.Data
+			}
+		}
+
+		chunkedFiles[name] = chunks
+	}
+
+	return chunkedFiles, blobStore
+}
+
+func simulatedPack(blobStore map[restic.ID][]byte) map[restic.ID]restic.ID {
+	blobToPack := map[restic.ID]restic.ID{}
+	i := 0
+	packID := restic.NewRandomID()
+	for blobID := range blobStore {
+		blobToPack[blobID] = packID
+		i++
+		if i%10 == 0 {
+			packID = restic.NewRandomID()
+		}
+	}
+
+	return blobToPack
+}
+
 func TestRechunkerRechunkData(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.TODO())
 	defer cancel()
-	repository.TestUseLowSecurityKDFParameters(t)
-
-	// prepare repositories
-	srcRepo, _ := repository.New(repository.TestBackend(t), repository.Options{})
-	dstTestsRepo, _ := repository.New(repository.TestBackend(t), repository.Options{})
-	dstWantsRepo, _ := repository.New(repository.TestBackend(t), repository.Options{})
 
 	srcChunkerParam, _ := chunker.RandomPolynomial()
 	dstChunkerParam, _ := chunker.RandomPolynomial()
 
-	repoVer := uint(restic.StableRepoVersion)
-	repoPw := rtest.TestPassword
-	_ = srcRepo.Init(ctx, repoVer, repoPw, &srcChunkerParam)
-	_ = dstTestsRepo.Init(ctx, repoVer, repoPw, &dstChunkerParam)
-	_ = dstWantsRepo.Init(ctx, repoVer, repoPw, &dstChunkerParam)
-
 	// prepare test data
-	src := archiver.TestDir{
-		"0": archiver.TestFile{Content: ""},
-		"1": archiver.TestFile{Content: string(rtest.Random(12, 10_000))},
-		"2": archiver.TestFile{Content: string(rtest.Random(13, 20_000_000))},
+	files := map[string][]byte{
+		"0": {},
+		"1": rtest.Random(1, 10_000),
+		"2": rtest.Random(2, 200_000),
+		"3": rtest.Random(3, 10_000_000),
+		"4": rtest.Random(4, 20_000_000),
+		"5": rtest.Random(5, 50_000_000),
+		"6": rtest.Random(6, 100_000_000),
 	}
-	dupFileContent := string(rtest.Random(16, 10_000_000))
-	src["dup1"] = archiver.TestFile{Content: dupFileContent}
-	src["dup2"] = archiver.TestFile{Content: dupFileContent}
+	files["3_duplicate"] = files["3"]
+	files["6_smiliar"] = append(rtest.Random(7, 10000), files["6"][10000:]...)
 
-	tempDir := rtest.TempDir(t)
-	archiver.TestCreateFiles(t, tempDir, src)
+	chnker := chunker.New(nil, 0)
+	srcChunkedFiles, srcBlobStore := chunkFiles(chnker, srcChunkerParam, files)
+	dstWantsChunkedFiles, _ := chunkFiles(chnker, dstChunkerParam, files)
+	dstTestsBlobStore := restic.IDSet{}
 
-	// archive data to the repos with archiver
-	srcSn := archiver.TestSnapshot(t, srcRepo, tempDir, nil)
-	_ = archiver.TestSnapshot(t, dstWantsRepo, tempDir, nil)
+	srcFilesList := []restic.IDs{}
+	for _, file := range srcChunkedFiles {
+		srcFilesList = append(srcFilesList, file)
+	}
+	srcBlobToPack := simulatedPack(srcBlobStore)
 
 	// do rechunking for dstTestRepo
-	rechunker := NewRechunker(srcRepo, dstTestsRepo)
-	wg, wgCtx := errgroup.WithContext(ctx)
-	dstTestsRepo.StartPackUploader(wgCtx, wg)
-	if err := rechunker.Plan(ctx, []restic.ID{*srcSn.Tree}); err != nil {
-		panic(err)
+	rechunker := NewRechunker(dstChunkerParam)
+	rechunker.reset()
+	rechunker.filesList = srcFilesList
+	rechunker.buildIndex(func(t restic.BlobType, id restic.ID) []restic.PackedBlob {
+		pb := restic.PackedBlob{}
+		pb.ID = id
+		pb.Type = t
+		pb.UncompressedLength = uint(len(srcBlobStore[id]))
+		pb.PackID = srcBlobToPack[id]
+
+		return []restic.PackedBlob{pb}
+	})
+	rechunker.rechunkReady = true
+
+	srcRepo := &TestRechunkerRepo{
+		loadBlobsFromPack: func(packID restic.ID, blobs []restic.Blob, handleBlobFn func(blob restic.BlobHandle, buf []byte, err error) error) error {
+			for _, blob := range blobs {
+				if packID != srcBlobToPack[blob.ID] {
+					return fmt.Errorf("blob %v is not in the pack %v", blob.ID, packID)
+				}
+				handleBlobFn(blob.BlobHandle, srcBlobStore[blob.ID], nil)
+			}
+			return nil
+		},
 	}
-	if err := rechunker.RechunkData(ctx, nil); err != nil {
-		panic(err)
+	dstTestsRepo := &TestRechunkerRepo{
+		saveBlob: func(buf []byte) (newID restic.ID, known bool, size int, err error) {
+			newID = restic.Hash(buf)
+			dstTestsBlobStore.Insert(newID)
+			return
+		},
 	}
-	if err := dstTestsRepo.Flush(ctx); err != nil {
+	if err := rechunker.RechunkData(ctx, srcRepo, dstTestsRepo, nil); err != nil {
 		panic(err)
 	}
 
 	// compare data blobs between dstWantsRepo and dstTestRepo
-	blobWants := restic.IDs{}
-	err := dstWantsRepo.ListBlobs(ctx, func(pb restic.PackedBlob) {
-		if pb.Type == restic.DataBlob {
-			blobWants = append(blobWants, pb.ID)
-		}
-	})
-	if err != nil {
-		panic(err)
-	}
-
-	for _, blobID := range blobWants {
-		_, ok := dstTestsRepo.LookupBlobSize(restic.DataBlob, blobID)
-		if !ok {
-			t.Errorf("Blob missing: %v", blobID)
+	rechunkMap := rechunker.rechunkMap
+	for name, srcBlobs := range srcChunkedFiles {
+		hashval := hashOfIDs(srcBlobs)
+		if hashOfIDs(dstWantsChunkedFiles[name]) != hashOfIDs(rechunkMap[hashval]) {
+			t.Errorf("rechunk not correct for %v", name)
 		}
 	}
 }
@@ -178,14 +244,6 @@ func buildTreeMapExtended(tree TestTree, m TreeMap) restic.ID {
 	return id
 }
 
-func NewRechunkerForTestRewriteTree(srcTree restic.BlobLoader, dstTree restic.BlobSaver) *Rechunker {
-	return &Rechunker{
-		blobLoader:     srcTree,
-		blobSaver:      dstTree,
-		rewriteTreeMap: map[restic.ID]restic.ID{},
-	}
-}
-
 func TestRechunkerRewriteTree(t *testing.T) {
 	blobIDsMap := map[string]BlobIDsPair{
 		"a":        generateBlobIDsPair(1, 1),
@@ -271,9 +329,10 @@ func TestRechunkerRewriteTree(t *testing.T) {
 	_, wantsRoot := BuildTreeMapExtended(wants)
 
 	testsRepo := WritableTreeMap{TreeMap{}}
-	rechunker := NewRechunkerForTestRewriteTree(srcRepo, testsRepo)
+	rechunker := NewRechunker(0)
+	rechunker.reset()
 	rechunker.rechunkMap = rechunkBlobsMap
-	testsRoot, err := rechunker.RewriteTree(context.TODO(), srcRoot)
+	testsRoot, err := rechunker.RewriteTree(context.TODO(), srcRepo, testsRepo, srcRoot)
 	if err != nil {
 		t.Error(err)
 	}
