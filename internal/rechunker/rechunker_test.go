@@ -1,4 +1,4 @@
-package walker
+package rechunker
 
 import (
 	"bytes"
@@ -12,12 +12,9 @@ import (
 
 	"github.com/restic/restic/internal/restic"
 	rtest "github.com/restic/restic/internal/test"
-	// borrowing test fixtures from following packages
 )
 
 // Reference: walker_test.go, rewriter_test.go (v0.18.0)
-
-// three tests: RechunkData integrity, RewriteTree integrity, all workflow running normally
 
 type TestRechunkerRepo struct {
 	loadBlobsFromPack func(packID restic.ID, blobs []restic.Blob, handleBlobFn func(blob restic.BlobHandle, buf []byte, err error) error) error
@@ -173,19 +170,41 @@ func generateBlobIDsPair(nSrc, nDst uint) BlobIDsPair {
 	return BlobIDsPair{srcBlobIDs: srcIDs, dstBlobIDs: dstIDs}
 }
 
+type TreeMap map[restic.ID][]byte
+type TestTree map[string]interface{}
 type TestContentNode struct {
 	Type    restic.NodeType
 	Size    uint64
 	Content restic.IDs
 }
 
-func BuildTreeMapExtended(tree TestTree) (m TreeMap, root restic.ID) {
+func (t TreeMap) LoadBlob(_ context.Context, _ restic.BlobType, id restic.ID, _ []byte) ([]byte, error) {
+	buf, ok := t[id]
+	if !ok {
+		return nil, fmt.Errorf("blob does not exist")
+	}
+	return buf, nil
+}
+
+func (t TreeMap) SaveBlob(_ context.Context, _ restic.BlobType, buf []byte, _ restic.ID, _ bool) (newID restic.ID, known bool, size int, err error) {
+	id := restic.Hash(buf)
+
+	_, ok := t[id]
+	if ok {
+		return id, false, 0, nil
+	}
+
+	t[id] = append([]byte{}, buf...)
+	return id, true, len(buf), nil
+}
+
+func BuildTreeMap(tree TestTree) (m TreeMap, root restic.ID) {
 	m = TreeMap{}
-	id := buildTreeMapExtended(tree, m)
+	id := buildTreeMap(tree, m)
 	return m, id
 }
 
-func buildTreeMapExtended(tree TestTree, m TreeMap) restic.ID {
+func buildTreeMap(tree TestTree, m TreeMap) restic.ID {
 	tb := restic.NewTreeJSONBuilder()
 	var names []string
 	for name := range tree {
@@ -196,17 +215,8 @@ func buildTreeMapExtended(tree TestTree, m TreeMap) restic.ID {
 	for _, name := range names {
 		item := tree[name]
 		switch elem := item.(type) {
-		case TestFile:
-			err := tb.AddNode(&restic.Node{
-				Name: name,
-				Type: restic.NodeTypeFile,
-				Size: elem.Size,
-			})
-			if err != nil {
-				panic(err)
-			}
 		case TestTree:
-			id := buildTreeMapExtended(elem, m)
+			id := buildTreeMap(elem, m)
 			err := tb.AddNode(&restic.Node{
 				Name:    name,
 				Subtree: &id,
@@ -325,10 +335,10 @@ func TestRechunkerRewriteTree(t *testing.T) {
 		},
 	}
 
-	srcRepo, srcRoot := BuildTreeMapExtended(tree)
-	_, wantsRoot := BuildTreeMapExtended(wants)
+	srcRepo, srcRoot := BuildTreeMap(tree)
+	_, wantsRoot := BuildTreeMap(wants)
 
-	testsRepo := WritableTreeMap{TreeMap{}}
+	testsRepo := TreeMap{}
 	rechunker := NewRechunker(0)
 	rechunker.reset()
 	rechunker.rechunkMap = rechunkBlobsMap
