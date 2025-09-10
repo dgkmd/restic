@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"sort"
+	"sync"
 	"testing"
 
 	"github.com/restic/chunker"
@@ -21,11 +22,11 @@ type TestRechunkerRepo struct {
 	saveBlob          func(buf []byte) (newID restic.ID, known bool, size int, err error)
 }
 
-func (trr *TestRechunkerRepo) LoadBlobsFromPack(ctx context.Context, packID restic.ID, blobs []restic.Blob, handleBlobFn func(blob restic.BlobHandle, buf []byte, err error) error) error {
-	return trr.loadBlobsFromPack(packID, blobs, handleBlobFn)
+func (r *TestRechunkerRepo) LoadBlobsFromPack(ctx context.Context, packID restic.ID, blobs []restic.Blob, handleBlobFn func(blob restic.BlobHandle, buf []byte, err error) error) error {
+	return r.loadBlobsFromPack(packID, blobs, handleBlobFn)
 }
-func (trr *TestRechunkerRepo) SaveBlob(ctx context.Context, t restic.BlobType, buf []byte, id restic.ID, storeDuplicate bool) (newID restic.ID, known bool, size int, err error) {
-	return trr.saveBlob(buf)
+func (r *TestRechunkerRepo) SaveBlob(ctx context.Context, t restic.BlobType, buf []byte, id restic.ID, storeDuplicate bool) (newID restic.ID, known bool, size int, err error) {
+	return r.saveBlob(buf)
 }
 
 func chunkFiles(chnker *chunker.Chunker, pol chunker.Pol, files map[string][]byte) (map[string]restic.IDs, map[restic.ID][]byte) {
@@ -92,11 +93,13 @@ func TestRechunkerRechunkData(t *testing.T) {
 		"6": rtest.Random(6, 100_000_000),
 	}
 	files["3_duplicate"] = files["3"]
-	files["6_smiliar"] = append(rtest.Random(7, 10000), files["6"][10000:]...)
+	files["6_prefix_changed"] = append(rtest.Random(7, 100_000), files["6"][50_000:]...)
+	files["6_suffix_changed"] = append([]byte{}, files["6"][:99_000_000]...)
+	files["6_suffix_changed"] = append(files["6_suffix_changed"], rtest.Random(8, 500_000)...)
 
 	chnker := chunker.New(nil, 0)
 	srcChunkedFiles, srcBlobStore := chunkFiles(chnker, srcChunkerParam, files)
-	dstWantsChunkedFiles, _ := chunkFiles(chnker, dstChunkerParam, files)
+	dstWantsChunkedFiles, dstWantsBlobStore := chunkFiles(chnker, dstChunkerParam, files)
 	dstTestsBlobStore := restic.IDSet{}
 
 	srcFilesList := []restic.IDs{}
@@ -109,7 +112,7 @@ func TestRechunkerRechunkData(t *testing.T) {
 	rechunker := NewRechunker(dstChunkerParam)
 	rechunker.reset()
 	rechunker.filesList = srcFilesList
-	rechunker.buildIndex(func(t restic.BlobType, id restic.ID) []restic.PackedBlob {
+	err := rechunker.buildIndex(func(t restic.BlobType, id restic.ID) []restic.PackedBlob {
 		pb := restic.PackedBlob{}
 		pb.ID = id
 		pb.Type = t
@@ -118,6 +121,10 @@ func TestRechunkerRechunkData(t *testing.T) {
 
 		return []restic.PackedBlob{pb}
 	})
+	if err != nil {
+		panic(err)
+	}
+
 	rechunker.rechunkReady = true
 
 	srcRepo := &TestRechunkerRepo{
@@ -126,15 +133,21 @@ func TestRechunkerRechunkData(t *testing.T) {
 				if packID != srcBlobToPack[blob.ID] {
 					return fmt.Errorf("blob %v is not in the pack %v", blob.ID, packID)
 				}
-				handleBlobFn(blob.BlobHandle, srcBlobStore[blob.ID], nil)
+				err := handleBlobFn(blob.BlobHandle, srcBlobStore[blob.ID], nil)
+				if err != nil {
+					return err
+				}
 			}
 			return nil
 		},
 	}
+	saveBlobLock := sync.Mutex{}
 	dstTestsRepo := &TestRechunkerRepo{
 		saveBlob: func(buf []byte) (newID restic.ID, known bool, size int, err error) {
 			newID = restic.Hash(buf)
+			saveBlobLock.Lock()
 			dstTestsBlobStore.Insert(newID)
+			saveBlobLock.Unlock()
 			return
 		},
 	}
@@ -142,12 +155,19 @@ func TestRechunkerRechunkData(t *testing.T) {
 		panic(err)
 	}
 
-	// compare data blobs between dstWantsRepo and dstTestRepo
+	// compare rechunkMap (rechunked) vs dstWantsChunkedFiles (standalone chunked)
 	rechunkMap := rechunker.rechunkMap
 	for name, srcBlobs := range srcChunkedFiles {
 		hashval := hashOfIDs(srcBlobs)
 		if hashOfIDs(dstWantsChunkedFiles[name]) != hashOfIDs(rechunkMap[hashval]) {
-			t.Errorf("rechunk not correct for %v", name)
+			t.Errorf("rechunk not correct for '%v'", name)
+		}
+	}
+
+	// check all blobs are stored
+	for blobID := range dstWantsBlobStore {
+		if _, ok := dstTestsBlobStore[blobID]; !ok {
+			t.Errorf("blob missing: %v", blobID.Str())
 		}
 	}
 }

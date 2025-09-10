@@ -6,8 +6,8 @@ import (
 	"github.com/restic/restic/internal/debug"
 	"github.com/restic/restic/internal/errors"
 	"github.com/restic/restic/internal/feature"
+	"github.com/restic/restic/internal/rechunker"
 	"github.com/restic/restic/internal/restic"
-	"github.com/restic/restic/internal/walker"
 	"golang.org/x/sync/errgroup"
 
 	"github.com/spf13/cobra"
@@ -123,7 +123,7 @@ func runRechunkCopy(ctx context.Context, opts RechunkCopyOptions, gopts GlobalOp
 		return ctx.Err()
 	}
 
-	rechunker := walker.NewRechunker(dstRepo.Config().ChunkerPolynomial)
+	rechnker := rechunker.NewRechunker(dstRepo.Config().ChunkerPolynomial)
 	rootTrees := []restic.ID{}
 
 	// first pass: gather all root trees of snapshots for rechunking
@@ -154,7 +154,7 @@ func runRechunkCopy(ctx context.Context, opts RechunkCopyOptions, gopts GlobalOp
 
 	wg, wgCtx := errgroup.WithContext(ctx)
 	dstRepo.StartPackUploader(wgCtx, wg)
-	if err = runRechunk(ctx, srcRepo, rootTrees, dstRepo, rechunker, gopts.Quiet); err != nil {
+	if err = runRechunk(ctx, srcRepo, rootTrees, dstRepo, rechnker, gopts.Quiet); err != nil {
 		return err
 	}
 
@@ -182,7 +182,7 @@ func runRechunkCopy(ctx context.Context, opts RechunkCopyOptions, gopts GlobalOp
 			}
 		}
 
-		_, err := rechunker.RewriteTree(ctx, srcRepo, dstRepo, *sn.Tree)
+		_, err := rechnker.RewriteTree(ctx, srcRepo, dstRepo, *sn.Tree)
 		if err != nil {
 			return err
 		}
@@ -224,7 +224,7 @@ func runRechunkCopy(ctx context.Context, opts RechunkCopyOptions, gopts GlobalOp
 			sn.Original = sn.ID()
 		}
 
-		newTreeID, err := rechunker.GetRewrittenTree(*sn.Tree)
+		newTreeID, err := rechnker.GetRewrittenTree(*sn.Tree)
 		if err != nil {
 			return err
 		}
@@ -241,7 +241,7 @@ func runRechunkCopy(ctx context.Context, opts RechunkCopyOptions, gopts GlobalOp
 	return ctx.Err()
 }
 
-func runRechunk(ctx context.Context, srcRepo restic.Repository, roots []restic.ID, dstRepo restic.Repository, rechunker *walker.Rechunker, quiet bool) error {
+func runRechunk(ctx context.Context, srcRepo restic.Repository, roots []restic.ID, dstRepo restic.Repository, rechunker *rechunker.Rechunker, quiet bool) error {
 	Verbosef("Rechunk scheduling start...\n")
 	err := rechunker.Plan(ctx, srcRepo, roots)
 	if err != nil {

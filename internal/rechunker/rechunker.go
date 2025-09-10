@@ -37,7 +37,7 @@ type dstChunk struct {
 	seqNum int
 	chunk  chunker.Chunk
 }
-type jumpOrder struct {
+type jumpSpec struct {
 	seqNum  int
 	blobIdx int
 	offset  uint
@@ -56,19 +56,19 @@ type Rechunker struct {
 	// read-only once built
 	filesList    []restic.IDs
 	blobLookup   map[restic.ID]blobLookupInfo // blob ID -> {blob length, pack ID}
-	sPackToFiles map[restic.ID][]fileType     // pack ID -> list of files{blob IDs, hashOfIDs} that contains any blob in the pack
+	sPackToFiles map[restic.ID][]fileType     // pack ID -> list of files{srcBlobIDs, hashOfIDs} that contains any blob in the pack
 	rechunkReady bool
 
 	// concurrently accessed across workers
-	rechunkMap        map[hashType]restic.IDs     // hashOfIDs of src blob IDs -> dst blob IDs
+	rechunkMap        map[hashType]restic.IDs     // hashOfIDs of srcBlobIDs -> dstBlobIDs
 	packToBlobs       map[restic.ID][]restic.Blob // pack ID -> list of blobs to be loaded from the pack
-	sPackRequires     map[hashType]int            // hashOfIDs -> number of packs until all blobs in the cache
+	sPackRequires     map[hashType]int            // hashOfIDs of srcBlobIDs -> number of packs until all blobs ready in the cache
 	rechunkMapLock    sync.Mutex
 	packToBlobsLock   sync.RWMutex
 	sPackRequiresLock sync.Mutex
 
 	// used in RewriteTree
-	rewriteTreeMap map[restic.ID]restic.ID // original tree ID -> rewritten tree ID
+	rewriteTreeMap map[restic.ID]restic.ID // original tree ID (in src repo) -> rewritten tree ID (for dst repo)
 }
 
 func NewRechunker(pol chunker.Pol) *Rechunker {
@@ -80,8 +80,8 @@ func NewRechunker(pol chunker.Pol) *Rechunker {
 	}
 }
 
-const SMALL_FILE_THRESHOLD = 50
-const LARGE_FILE_THRESHOLD = 50
+const SMALL_FILE_THRESHOLD = 25
+const LARGE_FILE_THRESHOLD = 25
 
 func (rc *Rechunker) reset() {
 	rc.filesList = nil
@@ -138,7 +138,7 @@ func (rc *Rechunker) buildIndex(lookupBlobFn func(t restic.BlobType, id restic.I
 	return nil
 }
 
-func (rc *Rechunker) Plan(ctx context.Context, srcRepo restic.Repository, roots []restic.ID) error {
+func (rc *Rechunker) Plan(ctx context.Context, srcRepo restic.Repository, rootTrees []restic.ID) error {
 	rc.reset()
 
 	visitedFiles := map[hashType]struct{}{}
@@ -153,7 +153,7 @@ func (rc *Rechunker) Plan(ctx context.Context, srcRepo restic.Repository, roots 
 	}
 
 	wg, wgCtx := errgroup.WithContext(ctx)
-	treeStream := restic.StreamTrees(wgCtx, wg, srcRepo, roots, func(id restic.ID) bool {
+	treeStream := restic.StreamTrees(wgCtx, wg, srcRepo, rootTrees, func(id restic.ID) bool {
 		visited := visitedTrees.Has(id)
 		visitedTrees.Insert(id)
 		return visited
@@ -350,7 +350,7 @@ func (rc *Rechunker) RechunkData(ctx context.Context, srcRepo PackBlobLoader, ds
 				chSrcChunk := make(chan srcChunk)
 				chNewPipe := make(chan newPipeSpec) // used only if useChainDict
 				chDstChunk := make(chan dstChunk)
-				chJumpOrder := make(chan jumpOrder, 1) // used only if useChainDict
+				chJumpOrder := make(chan jumpSpec, 1) // used only if useChainDict
 				r, w := io.Pipe()
 				chnker.Reset(r, rc.pol)
 				wg, wgCtx := errgroup.WithContext(wgWkrCtx)
@@ -391,7 +391,7 @@ func (rc *Rechunker) RechunkData(ctx context.Context, srcRepo PackBlobLoader, ds
 						prefixPos = blobPos[numFinishedBlobs] + newOffset
 						dstBlobs = prefixBlobs
 
-						chJumpOrder <- jumpOrder{
+						chJumpOrder <- jumpSpec{
 							seqNum:  0,
 							blobIdx: numFinishedBlobs,
 							offset:  newOffset,
@@ -581,8 +581,11 @@ func (rc *Rechunker) RechunkData(ctx context.Context, srcRepo PackBlobLoader, ds
 
 							var chunkSrcBlobs []restic.ID
 							if endIdx == len(srcBlobs) {
-								var nullID restic.ID
-								chunkSrcBlobs = append(srcBlobs[currIdx:endIdx], nullID)
+								chunkSrcBlobs = make([]restic.ID, endIdx-currIdx+1)
+								n := copy(chunkSrcBlobs, srcBlobs[currIdx:endIdx]) // last element of chunkSrcBlobs is nullID
+								if n != endIdx-currIdx {
+									return fmt.Errorf("srcBlobs tail copy failed")
+								}
 							} else {
 								chunkSrcBlobs = srcBlobs[currIdx : endIdx+1]
 							}
@@ -612,7 +615,7 @@ func (rc *Rechunker) RechunkData(ctx context.Context, srcRepo PackBlobLoader, ds
 								currPos = blobPos[currIdx] + newOffset
 
 								seqNum++
-								chJumpOrder <- jumpOrder{
+								chJumpOrder <- jumpSpec{
 									seqNum:  seqNum,
 									blobIdx: currIdx,
 									offset:  newOffset,
