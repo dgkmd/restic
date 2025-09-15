@@ -3,6 +3,7 @@ package rechunker
 import (
 	"context"
 	"crypto/sha256"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -43,7 +44,7 @@ type jumpSpec struct {
 	offset  uint
 }
 
-type PackBlobLoader interface {
+type PackedBlobLoader interface {
 	LoadBlobsFromPack(ctx context.Context, packID restic.ID, blobs []restic.Blob, handleBlobFn func(blob restic.BlobHandle, buf []byte, err error) error) error
 }
 
@@ -166,6 +167,16 @@ func (rc *Rechunker) Plan(ctx context.Context, srcRepo restic.Repository, rootTr
 				return tree.Error
 			}
 
+			// check if the tree blob is unstable json
+			buf, err := json.Marshal(tree.Tree)
+			if err != nil {
+				return err
+			}
+			buf = append(buf, '\n')
+			if tree.ID != restic.Hash(buf) {
+				return fmt.Errorf("can't run rechunk-copy, because the following tree can't be rewritten without losing information:\n%v", tree.ID.String())
+			}
+
 			for _, node := range tree.Nodes {
 				if node.Type == restic.NodeTypeFile {
 					hashval := hashOfIDs(node.Content)
@@ -195,7 +206,7 @@ func (rc *Rechunker) Plan(ctx context.Context, srcRepo restic.Repository, rootTr
 	return nil
 }
 
-func (rc *Rechunker) RechunkData(ctx context.Context, srcRepo PackBlobLoader, dstRepo restic.BlobSaver, p *progress.Counter) error {
+func (rc *Rechunker) RechunkData(ctx context.Context, srcRepo PackedBlobLoader, dstRepo restic.BlobSaver, p *progress.Counter) error {
 	if !rc.rechunkReady {
 		return fmt.Errorf("Plan() must be run first before RechunkData()")
 	}

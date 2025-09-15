@@ -55,7 +55,8 @@ Exit status is 12 if the password is incorrect.
 type RechunkCopyOptions struct {
 	secondaryRepoOptions
 	restic.SnapshotFilter
-	RechunkTags restic.TagLists
+	RechunkTags       restic.TagLists
+	isIntegrationTest bool // skip check for RESTIC_FEATURES=rechunk-copy when integration test
 }
 
 func (opts *RechunkCopyOptions) AddFlags(f *pflag.FlagSet) {
@@ -65,7 +66,7 @@ func (opts *RechunkCopyOptions) AddFlags(f *pflag.FlagSet) {
 }
 
 func runRechunkCopy(ctx context.Context, opts RechunkCopyOptions, gopts GlobalOptions, args []string) error {
-	if !feature.Flag.Enabled(feature.RechunkCopy) {
+	if !(feature.Flag.Enabled(feature.RechunkCopy) || opts.isIntegrationTest) {
 		return errors.Fatal("rechunk-copy feature flag is not set. Currently, rechunk-copy is alpha feature (disabled by default).")
 	}
 
