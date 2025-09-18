@@ -56,6 +56,7 @@ type RechunkCopyOptions struct {
 	secondaryRepoOptions
 	restic.SnapshotFilter
 	RechunkTags       restic.TagLists
+	UsePackCache bool
 	isIntegrationTest bool // skip check for RESTIC_FEATURES=rechunk-copy when integration test
 }
 
@@ -63,6 +64,7 @@ func (opts *RechunkCopyOptions) AddFlags(f *pflag.FlagSet) {
 	opts.secondaryRepoOptions.AddFlags(f, "destination", "to copy snapshots from")
 	initMultiSnapshotFilter(f, &opts.SnapshotFilter, true)
 	f.Var(&opts.RechunkTags, "rechunk-tag", "add `tags` for the copied snapshots in the format `tag[,tag,...]` (can be specified multiple times)")
+	f.BoolVar(&opts.UsePackCache, "use-pack-cache", false, "use pack cache for remote source repository")
 }
 
 func runRechunkCopy(ctx context.Context, opts RechunkCopyOptions, gopts GlobalOptions, args []string) error {
@@ -155,7 +157,7 @@ func runRechunkCopy(ctx context.Context, opts RechunkCopyOptions, gopts GlobalOp
 
 	wg, wgCtx := errgroup.WithContext(ctx)
 	dstRepo.StartPackUploader(wgCtx, wg)
-	if err = runRechunk(ctx, srcRepo, rootTrees, dstRepo, rechnker, gopts.Quiet); err != nil {
+	if err = runRechunk(ctx, srcRepo, rootTrees, dstRepo, rechnker, opts.UsePackCache, gopts.Quiet); err != nil {
 		return err
 	}
 
@@ -242,9 +244,9 @@ func runRechunkCopy(ctx context.Context, opts RechunkCopyOptions, gopts GlobalOp
 	return ctx.Err()
 }
 
-func runRechunk(ctx context.Context, srcRepo restic.Repository, roots []restic.ID, dstRepo restic.Repository, rechunker *rechunker.Rechunker, quiet bool) error {
+func runRechunk(ctx context.Context, srcRepo restic.Repository, roots []restic.ID, dstRepo restic.Repository, rechunker *rechunker.Rechunker, usePackCache bool, quiet bool) error {
 	Verbosef("Rechunk scheduling start...\n")
-	err := rechunker.Plan(ctx, srcRepo, roots)
+	err := rechunker.Plan(ctx, srcRepo, roots, usePackCache)
 	if err != nil {
 		return err
 	}

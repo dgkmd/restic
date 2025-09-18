@@ -17,12 +17,16 @@ import (
 
 // Reference: walker_test.go, rewriter_test.go (v0.18.0)
 
-// test repo implemented for `BlobSaver` and `PackedBlobLoader` interfaces
+// test repo that implements minimal Loader/Saver functions
 type TestRechunkerRepo struct {
+	loadBlob          func(id restic.ID, buf []byte) ([]byte, error)
 	loadBlobsFromPack func(packID restic.ID, blobs []restic.Blob, handleBlobFn func(blob restic.BlobHandle, buf []byte, err error) error) error
 	saveBlob          func(buf []byte) (newID restic.ID, known bool, size int, err error)
 }
 
+func (r *TestRechunkerRepo) LoadBlob(ctx context.Context, t restic.BlobType, id restic.ID, buf []byte) ([]byte, error) {
+	return r.loadBlob(id, buf)
+}
 func (r *TestRechunkerRepo) LoadBlobsFromPack(ctx context.Context, packID restic.ID, blobs []restic.Blob, handleBlobFn func(blob restic.BlobHandle, buf []byte, err error) error) error {
 	return r.loadBlobsFromPack(packID, blobs, handleBlobFn)
 }
@@ -30,7 +34,7 @@ func (r *TestRechunkerRepo) SaveBlob(ctx context.Context, t restic.BlobType, buf
 	return r.saveBlob(buf)
 }
 
-// chunk `files` by `pol` and return fileIndex (map from path to blob IDs) and chunkStore (map from blob ID to data)
+// chunk `files` by `pol` and return fileIndex (map from path to blob IDs) and chunkStore (map from blob ID to bytes data)
 func chunkFiles(chnker *chunker.Chunker, pol chunker.Pol, files map[string][]byte) (map[string]restic.IDs, map[restic.ID][]byte) {
 	fileIndex := map[string]restic.IDs{}
 	chunkStore := map[restic.ID][]byte{}
@@ -62,7 +66,7 @@ func chunkFiles(chnker *chunker.Chunker, pol chunker.Pol, files map[string][]byt
 	return fileIndex, chunkStore
 }
 
-// arbitrarily assign a pack to each blob in chunkStore
+// arbitrary pack assignment for blobs in chunkStore
 func simulatedPack(chunkStore map[restic.ID][]byte) map[restic.ID]restic.ID {
 	blobToPack := map[restic.ID]restic.ID{}
 	i := 0
@@ -82,6 +86,7 @@ func TestRechunkerRechunkData(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.TODO())
 	defer cancel()
 
+	// generate reandom polynomials
 	srcChunkerParam, _ := chunker.RandomPolynomial()
 	dstChunkerParam, _ := chunker.RandomPolynomial()
 
@@ -104,10 +109,12 @@ func TestRechunkerRechunkData(t *testing.T) {
 	suffixChanged = append(suffixChanged, rtest.Random(7, 500_000)...)
 	files["5_suffix_changed"] = suffixChanged
 
+	// prepare chunker and minimal repositories
 	chnker := chunker.New(nil, 0)
 	srcFileIndex, srcChunkStore := chunkFiles(chnker, srcChunkerParam, files)
 	dstWantsFileIndex, dstWantsChunkStore := chunkFiles(chnker, dstChunkerParam, files)
-	dstTestsChunkStore := restic.IDSet{}
+	rechunkStore1 := restic.IDSet{}
+	rechunkStore2 := restic.IDSet{}
 
 	srcFilesList := []restic.IDs{}
 	for _, file := range srcFileIndex {
@@ -115,23 +122,21 @@ func TestRechunkerRechunkData(t *testing.T) {
 	}
 	srcBlobToPack := simulatedPack(srcChunkStore)
 
-	// do rechunking for dstTestRepo
-	rechunker := NewRechunker(dstChunkerParam)
-	rechunker.reset()
-	rechunker.filesList = srcFilesList
-	rtest.OK(t, rechunker.buildIndex(func(t restic.BlobType, id restic.ID) []restic.PackedBlob {
-		pb := restic.PackedBlob{}
-		pb.ID = id
-		pb.Type = t
-		pb.UncompressedLength = uint(len(srcChunkStore[id]))
-		pb.PackID = srcBlobToPack[id]
-
-		return []restic.PackedBlob{pb}
-	}))
-
-	rechunker.rechunkReady = true
-
 	srcRepo := &TestRechunkerRepo{
+		loadBlob: func(id restic.ID, buf []byte) ([]byte, error) {
+			blob, ok := srcChunkStore[id]
+			if !ok {
+				return nil, fmt.Errorf("blob not found")
+			}
+
+			if cap(buf) < len(blob) {
+				buf = make([]byte, len(blob))
+			}
+			buf = buf[:len(blob)]
+			copy(buf, blob)
+
+			return buf, nil
+		},
 		loadBlobsFromPack: func(packID restic.ID, blobs []restic.Blob, handleBlobFn func(blob restic.BlobHandle, buf []byte, err error) error) error {
 			for _, blob := range blobs {
 				if packID != srcBlobToPack[blob.ID] {
@@ -145,31 +150,74 @@ func TestRechunkerRechunkData(t *testing.T) {
 			return nil
 		},
 	}
-	saveBlobLock := sync.Mutex{}
-	dstTestsRepo := &TestRechunkerRepo{
+
+	// test 1: rechunking without cache
+	rechunker1 := NewRechunker(dstChunkerParam)
+	rechunker1.reset()
+	rechunker1.filesList = srcFilesList
+	rechunker1.rechunkReady = true
+
+	saveBlobLock1 := sync.Mutex{}
+	rechunkTestRepo1 := &TestRechunkerRepo{
 		saveBlob: func(buf []byte) (newID restic.ID, known bool, size int, err error) {
 			newID = restic.Hash(buf)
-			saveBlobLock.Lock()
-			dstTestsChunkStore.Insert(newID)
-			saveBlobLock.Unlock()
+			saveBlobLock1.Lock()
+			rechunkStore1.Insert(newID)
+			saveBlobLock1.Unlock()
 			return
 		},
 	}
-	rtest.OK(t, rechunker.RechunkData(ctx, srcRepo, dstTestsRepo, nil))
+	rtest.OK(t, rechunker1.RechunkData(ctx, srcRepo, rechunkTestRepo1, nil))
 
-	// compare rechunkMap (rechunked) vs dstWantsChunkedFiles (standalone chunked)
-	rechunkMap := rechunker.rechunkMap
+	// test 2: rechunking with cache
+	rechunker2 := NewRechunker(dstChunkerParam)
+	rechunker2.reset()
+	rechunker2.filesList = srcFilesList
+	rtest.OK(t, rechunker2.buildPackIndex(func(t restic.BlobType, id restic.ID) []restic.PackedBlob {
+		pb := restic.PackedBlob{}
+		pb.ID = id
+		pb.Type = t
+		pb.UncompressedLength = uint(len(srcChunkStore[id]))
+		pb.PackID = srcBlobToPack[id]
+
+		return []restic.PackedBlob{pb}
+	}))
+	rechunker2.usePackCache = true
+	rechunker2.rechunkReady = true
+
+	saveBlobLock2 := sync.Mutex{}
+	rechunkTestRepo2 := &TestRechunkerRepo{
+		saveBlob: func(buf []byte) (newID restic.ID, known bool, size int, err error) {
+			newID = restic.Hash(buf)
+			saveBlobLock2.Lock()
+			rechunkStore2.Insert(newID)
+			saveBlobLock2.Unlock()
+			return
+		},
+	}
+	rtest.OK(t, rechunker2.RechunkData(ctx, srcRepo, rechunkTestRepo2, nil))
+
+	// compare test result (by rechunker) vs dstWantsChunkedFiles (ordinary chunking)
+	testResult1 := rechunker1.rechunkMap
+	testResult2 := rechunker2.rechunkMap
 	for name, srcBlobs := range srcFileIndex {
 		hashval := hashOfIDs(srcBlobs)
-		if hashOfIDs(dstWantsFileIndex[name]) != hashOfIDs(rechunkMap[hashval]) {
-			t.Errorf("rechunk not correct for '%v'", name)
+		wants := hashOfIDs(dstWantsFileIndex[name])
+		if hashOfIDs(testResult1[hashval]) != wants {
+			t.Errorf("rechunk test 1 mismatch for file '%v'", name)
+		}
+		if hashOfIDs(testResult2[hashval]) != wants {
+			t.Errorf("rechunk test 2 mismatch for file '%v'", name)
 		}
 	}
 
-	// check all blobs are stored
+	// check if all blobs are stored
 	for blobID := range dstWantsChunkStore {
-		if _, ok := dstTestsChunkStore[blobID]; !ok {
-			t.Errorf("blob missing: %v", blobID.Str())
+		if !rechunkStore1.Has(blobID) {
+			t.Errorf("blob missing for test 1: %v", blobID.Str())
+		}
+		if !rechunkStore2.Has(blobID) {
+			t.Errorf("blob missing for test 2: %v", blobID.Str())
 		}
 	}
 }

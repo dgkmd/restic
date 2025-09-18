@@ -11,35 +11,35 @@ import (
 	"golang.org/x/sync/errgroup"
 )
 
-type link interface{} // union of {terminalLink, continuedLink}
+type link interface{} // union of {terminalLink, connectingLink}
 type terminalLink struct {
 	dstBlob restic.ID
 	offset  uint
 }
-type continuedLink map[restic.ID]link
+type connectingLink map[restic.ID]link
 type linkIndex map[uint]link
-type chainDict map[restic.ID]linkIndex
+type chunkDict map[restic.ID]linkIndex
 
-type RechunkChainDict struct {
-	dict chainDict
+type ChunkDict struct {
+	dict chunkDict
 	lock sync.RWMutex
 }
 
-func NewRechunkChainDict() *RechunkChainDict {
-	return &RechunkChainDict{
-		dict: chainDict{},
+func NewChunkDict() *ChunkDict {
+	return &ChunkDict{
+		dict: chunkDict{},
 	}
 }
 
-func (rcd *RechunkChainDict) Match(srcBlobs restic.IDs, startOffset uint) (dstBlobs restic.IDs, numFinishedBlobs int, newOffset uint) {
+func (cd *ChunkDict) Match(srcBlobs restic.IDs, startOffset uint) (dstBlobs restic.IDs, numFinishedBlobs int, newOffset uint) {
 	if len(srcBlobs) == 0 { // nothing to return
 		return
 	}
 
-	rcd.lock.RLock()
-	defer rcd.lock.RUnlock()
+	cd.lock.RLock()
+	defer cd.lock.RUnlock()
 
-	lnk, ok := rcd.dict[srcBlobs[0]][startOffset]
+	lnk, ok := cd.dict[srcBlobs[0]][startOffset]
 	if !ok { // dict entry not found
 		return
 	}
@@ -56,11 +56,11 @@ func (rcd *RechunkChainDict) Match(srcBlobs restic.IDs, startOffset uint) (dstBl
 			if len(srcBlobs) == 0 { // EOF
 				return
 			}
-			lnk, ok = rcd.dict[srcBlobs[0]][newOffset]
+			lnk, ok = cd.dict[srcBlobs[0]][newOffset]
 			if !ok {
 				return
 			}
-		case continuedLink:
+		case connectingLink:
 			currentConsumedBlobs++
 			srcBlobs = srcBlobs[1:]
 
@@ -83,7 +83,7 @@ func (rcd *RechunkChainDict) Match(srcBlobs restic.IDs, startOffset uint) (dstBl
 	}
 }
 
-func (rcd *RechunkChainDict) Store(srcBlobs restic.IDs, startOffset, endOffset uint, dstBlob restic.ID) error {
+func (cd *ChunkDict) Store(srcBlobs restic.IDs, startOffset, endOffset uint, dstBlob restic.ID) error {
 	if len(srcBlobs) == 0 {
 		return fmt.Errorf("empty srcBlobs")
 	}
@@ -91,25 +91,25 @@ func (rcd *RechunkChainDict) Store(srcBlobs restic.IDs, startOffset, endOffset u
 		return fmt.Errorf("wrong value. len(srcBlob)==1 and startOffset>endOffset")
 	}
 
-	rcd.lock.Lock()
-	defer rcd.lock.Unlock()
+	cd.lock.Lock()
+	defer cd.lock.Unlock()
 
-	idx, ok := rcd.dict[srcBlobs[0]]
+	idx, ok := cd.dict[srcBlobs[0]]
 	if !ok {
-		rcd.dict[srcBlobs[0]] = linkIndex{}
-		idx = rcd.dict[srcBlobs[0]]
+		cd.dict[srcBlobs[0]] = linkIndex{}
+		idx = cd.dict[srcBlobs[0]]
 	}
 
 	// create link head
-	numContinuedLink := len(srcBlobs) - 1
-	singleTerminalLink := (numContinuedLink == 0)
+	numConnectingLink := len(srcBlobs) - 1
+	singleTerminalLink := (numConnectingLink == 0)
 	lnk, ok := idx[startOffset]
 	if ok { // index exists; type assertion
 		if singleTerminalLink {
 			_ = lnk.(terminalLink)
 			return nil // nothing to touch
 		}
-		_ = lnk.(continuedLink)
+		_ = lnk.(connectingLink)
 	} else { // index does not exist
 		if singleTerminalLink {
 			idx[startOffset] = terminalLink{
@@ -118,24 +118,24 @@ func (rcd *RechunkChainDict) Store(srcBlobs restic.IDs, startOffset, endOffset u
 			}
 			return nil
 		}
-		idx[startOffset] = continuedLink{}
+		idx[startOffset] = connectingLink{}
 		lnk = idx[startOffset]
 	}
 	srcBlobs = srcBlobs[1:]
 
-	// build remaining continuedLink chain
-	for range numContinuedLink - 1 {
-		c := lnk.(continuedLink)
+	// build remaining connectingLink chain
+	for range numConnectingLink - 1 {
+		c := lnk.(connectingLink)
 		lnk, ok = c[srcBlobs[0]]
 		if !ok {
-			c[srcBlobs[0]] = continuedLink{}
+			c[srcBlobs[0]] = connectingLink{}
 			lnk = c[srcBlobs[0]]
 		}
 		srcBlobs = srcBlobs[1:]
 	}
 
 	// create terminalLink
-	c := lnk.(continuedLink)
+	c := lnk.(connectingLink)
 	lnk, ok = c[srcBlobs[0]]
 	if ok { // found that entire chain existed!
 		_ = lnk.(terminalLink)
@@ -155,18 +155,18 @@ const LRU_SIZE = 100
 
 type PackLRU = *lru.Cache[restic.ID, []restic.ID]
 
-type packBlobData struct {
+type packedBlobData struct {
 	data   []byte
 	packID restic.ID
 }
-type BlobData = map[restic.ID][]byte
+type BlobsMap = map[restic.ID][]byte
 
-type RechunkBlobCache struct {
+type PackCache struct {
 	pcklru         PackLRU
 	packDownloadCh chan restic.ID
-	blobLookup     map[restic.ID]blobLookupInfo
+	blobLookup     map[restic.ID]blobInfo
 
-	blobs          map[restic.ID]packBlobData
+	blobs          map[restic.ID]packedBlobData
 	packWaiter     map[restic.ID]chan struct{}
 	blobsLock      sync.RWMutex
 	packWaiterLock sync.Mutex
@@ -174,23 +174,23 @@ type RechunkBlobCache struct {
 	closed bool
 }
 
-func NewRechunkBlobCache(ctx context.Context, wg *errgroup.Group, blobLookup map[restic.ID]blobLookupInfo, numDownloaders int,
-	downloadFn func(packID restic.ID) (BlobData, error), onPackReady func(packID restic.ID), onPackEvict func(packID restic.ID)) *RechunkBlobCache {
-	rbc := &RechunkBlobCache{
+func NewPackCache(ctx context.Context, wg *errgroup.Group, blobLookup map[restic.ID]blobInfo, numDownloaders int,
+	downloadFn func(packID restic.ID) (BlobsMap, error), onPackReady func(packID restic.ID), onPackEvict func(packID restic.ID)) *PackCache {
+	pc := &PackCache{
 		packDownloadCh: make(chan restic.ID),
 		blobLookup:     blobLookup,
-		blobs:          map[restic.ID]packBlobData{},
+		blobs:          map[restic.ID]packedBlobData{},
 		packWaiter:     map[restic.ID]chan struct{}{},
 	}
 	lru, err := lru.NewWithEvict(LRU_SIZE, func(k restic.ID, v []restic.ID) {
-		rbc.packWaiterLock.Lock()
-		delete(rbc.packWaiter, k)
-		rbc.packWaiterLock.Unlock()
-		rbc.blobsLock.Lock()
+		pc.packWaiterLock.Lock()
+		delete(pc.packWaiter, k)
+		pc.packWaiterLock.Unlock()
+		pc.blobsLock.Lock()
 		for _, blob := range v {
-			delete(rbc.blobs, blob)
+			delete(pc.blobs, blob)
 		}
-		rbc.blobsLock.Unlock()
+		pc.blobsLock.Unlock()
 		if onPackEvict != nil {
 			onPackEvict(k)
 		}
@@ -198,7 +198,7 @@ func NewRechunkBlobCache(ctx context.Context, wg *errgroup.Group, blobLookup map
 	if err != nil {
 		panic(err)
 	}
-	rbc.pcklru = lru
+	pc.pcklru = lru
 
 	// start pack downloader
 	for range numDownloaders {
@@ -209,52 +209,52 @@ func NewRechunkBlobCache(ctx context.Context, wg *errgroup.Group, blobLookup map
 				select {
 				case <-ctx.Done():
 					return ctx.Err()
-				case packID, ok = <-rbc.packDownloadCh:
+				case packID, ok = <-pc.packDownloadCh:
 					if !ok { // job complete
 						return nil
 					}
 				}
 
-				if rbc.pcklru.Contains(packID) {
+				if pc.pcklru.Contains(packID) {
 					// pack already downloaded by the previous request
 					continue
 				}
-				blobData, err := downloadFn(packID)
+				blobsMap, err := downloadFn(packID)
 				if err != nil {
 					return err
 				}
-				blobIDs := make([]restic.ID, 0, len(blobData))
-				for id := range blobData {
+				blobIDs := make([]restic.ID, 0, len(blobsMap))
+				for id := range blobsMap {
 					blobIDs = append(blobIDs, id)
 				}
-				rbc.blobsLock.Lock()
-				for id, data := range blobData {
-					rbc.blobs[id] = packBlobData{
+				pc.blobsLock.Lock()
+				for id, data := range blobsMap {
+					pc.blobs[id] = packedBlobData{
 						data:   data,
 						packID: packID,
 					}
 				}
-				rbc.blobsLock.Unlock()
-				_ = rbc.pcklru.Add(packID, blobIDs)
+				pc.blobsLock.Unlock()
+				_ = pc.pcklru.Add(packID, blobIDs)
 				if onPackReady != nil {
 					onPackReady(packID)
 				}
-				rbc.packWaiterLock.Lock()
-				close(rbc.packWaiter[packID])
-				rbc.packWaiterLock.Unlock()
+				pc.packWaiterLock.Lock()
+				close(pc.packWaiter[packID])
+				pc.packWaiterLock.Unlock()
 			}
 		})
 	}
 
-	return rbc
+	return pc
 }
 
-func (rbc *RechunkBlobCache) Get(ctx context.Context, wg *errgroup.Group, id restic.ID, buf []byte) ([]byte, chan []byte) {
-	rbc.blobsLock.RLock()
-	blob, ok := rbc.blobs[id]
-	rbc.blobsLock.RUnlock()
+func (pc *PackCache) Get(ctx context.Context, wg *errgroup.Group, id restic.ID, buf []byte) ([]byte, chan []byte) {
+	pc.blobsLock.RLock()
+	blob, ok := pc.blobs[id]
+	pc.blobsLock.RUnlock()
 	if ok { // when blob exists in cache: return that blob
-		_, _ = rbc.pcklru.Get(blob.packID) // update recency
+		_, _ = pc.pcklru.Get(blob.packID) // update recency
 		if cap(buf) < len(blob.data) {
 			debug.Log("buffer has smaller capacity than chunk size. Something might be wrong!")
 			buf = make([]byte, len(blob.data))
@@ -264,22 +264,22 @@ func (rbc *RechunkBlobCache) Get(ctx context.Context, wg *errgroup.Group, id res
 		return buf, nil
 	}
 
-	// when blob does not exist in cache: return async ch and queue pack download
-	ch := make(chan []byte, 1)
+	// when blob does not exist in cache: return async ch and send corresponding packID to downloader
+	ch := make(chan []byte, 1) // where the downloaded blob will be delivered
 	wg.Go(func() error {
-		packID := rbc.blobLookup[id].packID
-		rbc.packWaiterLock.Lock()
-		chWaiter, ok := rbc.packWaiter[packID]
+		packID := pc.blobLookup[id].packID
+		pc.packWaiterLock.Lock()
+		chWaiter, ok := pc.packWaiter[packID]
 		if !ok {
 			chWaiter = make(chan struct{})
-			rbc.packWaiter[packID] = chWaiter
+			pc.packWaiter[packID] = chWaiter
 		}
-		rbc.packWaiterLock.Unlock()
+		pc.packWaiterLock.Unlock()
 		if !ok {
 			select {
 			case <-ctx.Done():
 				return ctx.Err()
-			case rbc.packDownloadCh <- packID:
+			case pc.packDownloadCh <- packID:
 			}
 		}
 		select {
@@ -287,9 +287,9 @@ func (rbc *RechunkBlobCache) Get(ctx context.Context, wg *errgroup.Group, id res
 			return ctx.Err()
 		case <-chWaiter:
 		}
-		rbc.blobsLock.RLock()
-		blob, ok = rbc.blobs[id]
-		rbc.blobsLock.RUnlock()
+		pc.blobsLock.RLock()
+		blob, ok = pc.blobs[id]
+		pc.blobsLock.RUnlock()
 		if !ok {
 			return fmt.Errorf("blob entry missing right after pack download. Please report this error at https://github.com/restic/restic/issues/")
 		}
@@ -305,9 +305,9 @@ func (rbc *RechunkBlobCache) Get(ctx context.Context, wg *errgroup.Group, id res
 	return nil, ch
 }
 
-func (rbc *RechunkBlobCache) Close() {
-	if !rbc.closed {
-		close(rbc.packDownloadCh)
-		rbc.closed = true
+func (pc *PackCache) Close() {
+	if !pc.closed {
+		close(pc.packDownloadCh)
+		pc.closed = true
 	}
 }
