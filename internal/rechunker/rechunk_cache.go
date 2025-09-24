@@ -164,7 +164,7 @@ type BlobsMap = map[restic.ID][]byte
 type PackCache struct {
 	pcklru         PackLRU
 	packDownloadCh chan restic.ID
-	blobLookup     map[restic.ID]blobInfo
+	blobToPack     map[restic.ID]restic.ID
 
 	blobs          map[restic.ID]packedBlobData
 	packWaiter     map[restic.ID]chan struct{}
@@ -174,11 +174,11 @@ type PackCache struct {
 	closed bool
 }
 
-func NewPackCache(ctx context.Context, wg *errgroup.Group, blobLookup map[restic.ID]blobInfo, numDownloaders int,
+func NewPackCache(ctx context.Context, wg *errgroup.Group, blobToPack map[restic.ID]restic.ID, numDownloaders int,
 	downloadFn func(packID restic.ID) (BlobsMap, error), onPackReady func(packID restic.ID), onPackEvict func(packID restic.ID)) *PackCache {
 	pc := &PackCache{
 		packDownloadCh: make(chan restic.ID),
-		blobLookup:     blobLookup,
+		blobToPack:     blobToPack,
 		blobs:          map[restic.ID]packedBlobData{},
 		packWaiter:     map[restic.ID]chan struct{}{},
 	}
@@ -267,7 +267,7 @@ func (pc *PackCache) Get(ctx context.Context, wg *errgroup.Group, id restic.ID, 
 	// when blob does not exist in cache: return async ch and send corresponding packID to downloader
 	ch := make(chan []byte, 1) // where the downloaded blob will be delivered
 	wg.Go(func() error {
-		packID := pc.blobLookup[id].packID
+		packID := pc.blobToPack[id]
 		pc.packWaiterLock.Lock()
 		chWaiter, ok := pc.packWaiter[packID]
 		if !ok {

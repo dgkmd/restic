@@ -56,7 +56,7 @@ type RechunkCopyOptions struct {
 	secondaryRepoOptions
 	restic.SnapshotFilter
 	RechunkTags       restic.TagLists
-	UsePackCache bool
+	UsePackCache      bool
 	isIntegrationTest bool // skip check for RESTIC_FEATURES=rechunk-copy when integration test
 }
 

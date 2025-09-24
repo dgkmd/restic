@@ -17,15 +17,10 @@ import (
 )
 
 type hashType = [32]byte
-type chunkedFileInfo struct {
+type fileInfo struct {
 	restic.IDs
 	hashval hashType
 }
-type blobInfo struct {
-	dataLength uint
-	packID     restic.ID
-}
-
 type srcChunkMsg struct {
 	seqNum int
 	blob   []byte
@@ -56,15 +51,15 @@ type Rechunker struct {
 	chunkDict *ChunkDict
 
 	filesList    []restic.IDs
+	blobSize     map[restic.ID]uint
 	rechunkReady bool
 	usePackCache bool
 
 	// used if usePackCache == true
-	blobLookup         map[restic.ID]blobInfo          // blob ID -> {blob length, pack ID}
-	packToBlobs        map[restic.ID][]restic.Blob     // pack ID -> list of blobs to be loaded from the pack
-	sfPackToFiles      map[restic.ID][]chunkedFileInfo // pack ID -> list of files{srcBlobIDs, hashOfIDs} that contains any blob in the pack (small files only)
-	sfPackRequires     map[hashType]int                // hashOfIDs of srcBlobIDs -> number of packs until all blobs become ready in the cache (small files only)
-	packToBlobsLock    sync.RWMutex
+	blobToPack         map[restic.ID]restic.ID     // blob ID -> {blob length, pack ID}
+	packToBlobs        map[restic.ID][]restic.Blob // pack ID -> list of blobs to be loaded from the pack
+	sfPackToFiles      map[restic.ID][]fileInfo    // pack ID -> list of files{srcBlobIDs, hashOfIDs} that contains any blob in the pack (small files only)
+	sfPackRequires     map[hashType]int            // hashOfIDs of srcBlobIDs -> number of packs until all blobs become ready in the cache (small files only)
 	sfPackRequiresLock sync.Mutex
 
 	// used in RewriteTree
@@ -87,15 +82,16 @@ const LARGE_FILE_THRESHOLD = 50
 
 func (rc *Rechunker) reset() {
 	rc.filesList = nil
+	rc.blobSize = map[restic.ID]uint{}
 	rc.rechunkReady = false
 
-	rc.blobLookup = map[restic.ID]blobInfo{}
+	rc.blobToPack = map[restic.ID]restic.ID{}
 	rc.packToBlobs = map[restic.ID][]restic.Blob{}
-	rc.sfPackToFiles = map[restic.ID][]chunkedFileInfo{}
+	rc.sfPackToFiles = map[restic.ID][]fileInfo{}
 	rc.sfPackRequires = map[hashType]int{}
 }
 
-func (rc *Rechunker) buildPackIndex(lookupBlobFn func(t restic.BlobType, id restic.ID) []restic.PackedBlob) error {
+func (rc *Rechunker) buildIndex(usePackCache bool, lookupBlobFn func(t restic.BlobType, id restic.ID) []restic.PackedBlob) error {
 	// collect all required blobs
 	allBlobs := restic.IDSet{}
 	for _, file := range rc.filesList {
@@ -104,7 +100,7 @@ func (rc *Rechunker) buildPackIndex(lookupBlobFn func(t restic.BlobType, id rest
 		}
 	}
 
-	// build pack<->blob map
+	// build blob lookup info
 	for blob := range allBlobs {
 		packs := lookupBlobFn(restic.DataBlob, blob)
 		if len(packs) == 0 {
@@ -112,14 +108,18 @@ func (rc *Rechunker) buildPackIndex(lookupBlobFn func(t restic.BlobType, id rest
 		}
 		pb := packs[0]
 
-		rc.packToBlobs[pb.PackID] = append(rc.packToBlobs[pb.PackID], pb.Blob)
-		rc.blobLookup[pb.Blob.ID] = blobInfo{
-			dataLength: pb.DataLength(),
-			packID:     pb.PackID,
+		rc.blobSize[pb.Blob.ID] = pb.DataLength()
+		if usePackCache {
+			rc.blobToPack[pb.Blob.ID] = pb.PackID
+			rc.packToBlobs[pb.PackID] = append(rc.packToBlobs[pb.PackID], pb.Blob)
 		}
 	}
 
-	// build pack<->file metadata for small files
+	if !usePackCache { // nothing more to do
+		return nil
+	}
+
+	// build file<->pack info for small files
 	for _, file := range rc.filesList {
 		if len(file) >= SMALL_FILE_THRESHOLD {
 			continue
@@ -127,12 +127,12 @@ func (rc *Rechunker) buildPackIndex(lookupBlobFn func(t restic.BlobType, id rest
 		hashval := hashOfIDs(file)
 		packSet := restic.IDSet{}
 		for _, blob := range file {
-			pack := rc.blobLookup[blob].packID
+			pack := rc.blobToPack[blob]
 			packSet.Insert(pack)
 		}
 		rc.sfPackRequires[hashval] = len(packSet)
 		for p := range packSet {
-			rc.sfPackToFiles[p] = append(rc.sfPackToFiles[p], chunkedFileInfo{file, hashval})
+			rc.sfPackToFiles[p] = append(rc.sfPackToFiles[p], fileInfo{file, hashval})
 		}
 	}
 
@@ -196,14 +196,12 @@ func (rc *Rechunker) Plan(ctx context.Context, srcRepo restic.Repository, rootTr
 		return err
 	}
 
-	rc.usePackCache = usePackCache
-	if usePackCache {
-		err = rc.buildPackIndex(srcRepo.LookupBlob)
-		if err != nil {
-			return err
-		}
+	err = rc.buildIndex(usePackCache, srcRepo.LookupBlob)
+	if err != nil {
+		return err
 	}
 
+	rc.usePackCache = usePackCache
 	rc.rechunkReady = true
 
 	return nil
@@ -227,12 +225,10 @@ func (rc *Rechunker) RechunkData(ctx context.Context, srcRepo PackedBlobLoader, 
 	var priorityFilesListLock sync.Mutex
 
 	if rc.usePackCache {
-		cache = NewPackCache(wgMgrCtx, wgMgr, rc.blobLookup, numDownloaders, func(packID restic.ID) (BlobsMap, error) {
+		cache = NewPackCache(wgMgrCtx, wgMgr, rc.blobToPack, numDownloaders, func(packID restic.ID) (BlobsMap, error) {
 			// downloadFn implementation
 			blobData := BlobsMap{}
-			rc.packToBlobsLock.RLock()
 			blobs := rc.packToBlobs[packID]
-			rc.packToBlobsLock.RUnlock()
 			err := srcRepo.LoadBlobsFromPack(wgWkrCtx, packID, blobs,
 				func(blob restic.BlobHandle, buf []byte, err error) error {
 					if err != nil {
@@ -396,14 +392,17 @@ func (rc *Rechunker) RechunkData(ctx context.Context, srcRepo PackedBlobLoader, 
 				var seekBlobPos func(uint, int) (int, uint)
 				var prefixPos uint
 				var prefixIdx int
-				useChunkDict := len(srcBlobs) >= LARGE_FILE_THRESHOLD
+				useChunkDict := len(srcBlobs) != 0 && len(srcBlobs) >= LARGE_FILE_THRESHOLD
 				if useChunkDict {
 					// build blobPos (position of each blob in a file)
 					blobPos = make([]uint, len(srcBlobs)+1)
 					var offset uint
 					for i, blob := range srcBlobs {
-						offset += rc.blobLookup[blob].dataLength
+						offset += rc.blobSize[blob]
 						blobPos[i+1] = offset
+					}
+					if blobPos[1] == 0 { // assertion
+						panic("blobPos not computed correctly")
 					}
 
 					// define seekBlobPos

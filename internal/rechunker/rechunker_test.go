@@ -94,20 +94,18 @@ func TestRechunkerRechunkData(t *testing.T) {
 	files := map[string][]byte{
 		"0": {},
 		"1": rtest.Random(1, 10_000),
-		"2": rtest.Random(2, 200_000),
-		"3": rtest.Random(3, 10_000_000),
-		"4": rtest.Random(4, 20_000_000),
-		"5": rtest.Random(5, 50_000_000),
+		"2": rtest.Random(4, 20_000_000),
+		"3": rtest.Random(5, 100_000_000),
 	}
-	files["3_duplicate"] = files["3"]
-	prefixChanged := make([]byte, 0, 50_500_000)
+	files["2_duplicate"] = files["3"]
+	prefixChanged := make([]byte, 0, 100_500_000)
 	prefixChanged = append(prefixChanged, rtest.Random(6, 1_000_000)...)
-	prefixChanged = append(prefixChanged, files["5"][500_000:]...)
-	files["5_prefix_changed"] = prefixChanged
-	suffixChanged := make([]byte, 0, 49_500_000)
-	suffixChanged = append(suffixChanged, files["5"][:49_000_000]...)
+	prefixChanged = append(prefixChanged, files["3"][500_000:]...)
+	files["3_prefix_changed"] = prefixChanged
+	suffixChanged := make([]byte, 0, 99_500_000)
+	suffixChanged = append(suffixChanged, files["3"][:99_000_000]...)
 	suffixChanged = append(suffixChanged, rtest.Random(7, 500_000)...)
-	files["5_suffix_changed"] = suffixChanged
+	files["3_suffix_changed"] = suffixChanged
 
 	// prepare chunker and minimal repositories
 	chnker := chunker.New(nil, 0)
@@ -155,6 +153,15 @@ func TestRechunkerRechunkData(t *testing.T) {
 	rechunker1 := NewRechunker(dstChunkerParam)
 	rechunker1.reset()
 	rechunker1.filesList = srcFilesList
+	rtest.OK(t, rechunker1.buildIndex(false, func(t restic.BlobType, id restic.ID) []restic.PackedBlob {
+		pb := restic.PackedBlob{}
+		pb.ID = id
+		pb.Type = t
+		pb.UncompressedLength = uint(len(srcChunkStore[id]))
+		pb.PackID = srcBlobToPack[id]
+
+		return []restic.PackedBlob{pb}
+	}))
 	rechunker1.rechunkReady = true
 
 	saveBlobLock1 := sync.Mutex{}
@@ -173,7 +180,7 @@ func TestRechunkerRechunkData(t *testing.T) {
 	rechunker2 := NewRechunker(dstChunkerParam)
 	rechunker2.reset()
 	rechunker2.filesList = srcFilesList
-	rtest.OK(t, rechunker2.buildPackIndex(func(t restic.BlobType, id restic.ID) []restic.PackedBlob {
+	rtest.OK(t, rechunker2.buildIndex(true, func(t restic.BlobType, id restic.ID) []restic.PackedBlob {
 		pb := restic.PackedBlob{}
 		pb.ID = id
 		pb.Type = t
