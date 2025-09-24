@@ -21,6 +21,7 @@ import (
 	"github.com/restic/restic/internal/debug"
 	"github.com/restic/restic/internal/errors"
 	"github.com/restic/restic/internal/feature"
+	"github.com/restic/restic/internal/terminal"
 
 	"github.com/cenkalti/backoff/v4"
 	"github.com/pkg/sftp"
@@ -84,7 +85,7 @@ func startClient(cfg Config) (*SFTP, error) {
 		return nil, errors.Wrap(err, "cmd.StdoutPipe")
 	}
 
-	bg, err := util.StartForeground(cmd)
+	bg, err := terminal.StartForeground(cmd)
 	if err != nil {
 		if errors.Is(err, exec.ErrDot) {
 			return nil, errors.Errorf("cannot implicitly run relative executable %v found in current directory, use -o sftp.command=./<command> to override", cmd.Path)
@@ -175,7 +176,6 @@ func (r *SFTP) mkdirAllDataSubdirs(ctx context.Context, nconn uint) error {
 	g.SetLimit(int(nconn))
 
 	for _, d := range r.Paths() {
-		d := d
 		g.Go(func() error {
 			// First try Mkdir. For most directories in Paths, this takes one
 			// round trip, not counting duplicate parent creations causes by

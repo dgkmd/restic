@@ -1,23 +1,17 @@
-//go:build aix || solaris
-// +build aix solaris
-
-package util
+package terminal
 
 import (
 	"os/exec"
 	"syscall"
 
 	"github.com/restic/restic/internal/errors"
+	"golang.org/x/sys/windows"
 )
 
 func startForeground(cmd *exec.Cmd) (bg func() error, err error) {
-	// run the command in its own process group so that SIGINT
-	// is not sent to it.
-	cmd.SysProcAttr = &syscall.SysProcAttr{
-		Setpgid: true,
-	}
-
-	// start the process
+	// just start the process and hope for the best
+	cmd.SysProcAttr = &syscall.SysProcAttr{}
+	cmd.SysProcAttr.CreationFlags = windows.CREATE_NEW_PROCESS_GROUP
 	err = cmd.Start()
 	if err != nil {
 		return nil, errors.Wrap(err, "cmd.Start")
