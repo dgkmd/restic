@@ -7,6 +7,7 @@ import (
 	"testing"
 
 	rtest "github.com/restic/restic/internal/test"
+	"github.com/restic/restic/internal/ui"
 )
 
 // Reference: cmd_copy_integration_test.go (v0.18.0)
@@ -25,7 +26,9 @@ func testRunRechunkCopy(t testing.TB, srcGopts GlobalOptions, dstGopts GlobalOpt
 		isIntegrationTest: true,
 	}
 
-	rtest.OK(t, runRechunkCopy(context.TODO(), rechunkCopyOpts, gopts, nil))
+	rtest.OK(t, withTermStatus(gopts, func(ctx context.Context, term ui.Terminal) error {
+		return runRechunkCopy(context.TODO(), rechunkCopyOpts, gopts, nil, term)
+	}))
 }
 
 func TestRechunkCopy(t *testing.T) {

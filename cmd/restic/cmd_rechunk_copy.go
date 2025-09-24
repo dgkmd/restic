@@ -8,6 +8,8 @@ import (
 	"github.com/restic/restic/internal/feature"
 	"github.com/restic/restic/internal/rechunker"
 	"github.com/restic/restic/internal/restic"
+	"github.com/restic/restic/internal/ui"
+	"github.com/restic/restic/internal/ui/progress"
 	"golang.org/x/sync/errgroup"
 
 	"github.com/spf13/cobra"
@@ -43,7 +45,9 @@ Exit status is 12 if the password is incorrect.
 		GroupID:           cmdGroupDefault,
 		DisableAutoGenTag: true,
 		RunE: func(cmd *cobra.Command, args []string) error {
-			return runRechunkCopy(cmd.Context(), opts, globalOptions, args)
+			term, cancel := setupTermstatus()
+			defer cancel()
+			return runRechunkCopy(cmd.Context(), opts, globalOptions, args, term)
 		},
 	}
 
@@ -67,12 +71,13 @@ func (opts *RechunkCopyOptions) AddFlags(f *pflag.FlagSet) {
 	f.BoolVar(&opts.UsePackCache, "use-pack-cache", false, "use pack cache for remote source repository")
 }
 
-func runRechunkCopy(ctx context.Context, opts RechunkCopyOptions, gopts GlobalOptions, args []string) error {
-	if !(feature.Flag.Enabled(feature.RechunkCopy) || opts.isIntegrationTest) {
+func runRechunkCopy(ctx context.Context, opts RechunkCopyOptions, gopts GlobalOptions, args []string, term ui.Terminal) error {
+	if !feature.Flag.Enabled(feature.RechunkCopy) && !opts.isIntegrationTest {
 		return errors.Fatal("rechunk-copy feature flag is not set. Currently, rechunk-copy is alpha feature (disabled by default).")
 	}
 
-	secondaryGopts, isFromRepo, err := fillSecondaryGlobalOpts(ctx, opts.secondaryRepoOptions, gopts, "destination")
+	printer := newTerminalProgressPrinter(false, gopts.verbosity, term)
+	secondaryGopts, isFromRepo, err := fillSecondaryGlobalOpts(ctx, opts.secondaryRepoOptions, gopts, "destination", printer)
 	if err != nil {
 		return err
 	}
@@ -81,13 +86,13 @@ func runRechunkCopy(ctx context.Context, opts RechunkCopyOptions, gopts GlobalOp
 		gopts, secondaryGopts = secondaryGopts, gopts
 	}
 
-	ctx, srcRepo, unlock, err := openWithReadLock(ctx, gopts, gopts.NoLock)
+	ctx, srcRepo, unlock, err := openWithReadLock(ctx, gopts, gopts.NoLock, printer)
 	if err != nil {
 		return err
 	}
 	defer unlock()
 
-	ctx, dstRepo, unlock, err := openWithAppendLock(ctx, secondaryGopts, false)
+	ctx, dstRepo, unlock, err := openWithAppendLock(ctx, secondaryGopts, false, printer)
 	if err != nil {
 		return err
 	}
@@ -98,93 +103,34 @@ func runRechunkCopy(ctx context.Context, opts RechunkCopyOptions, gopts GlobalOp
 		return err
 	}
 
-	dstSnapshotLister, err := restic.MemorizeList(ctx, dstRepo, restic.SnapshotFile)
-	if err != nil {
-		return err
-	}
-
 	debug.Log("Loading source index")
-	bar := newIndexProgress(gopts.Quiet, gopts.JSON)
+	bar := newIndexTerminalProgress(printer)
 	if err := srcRepo.LoadIndex(ctx, bar); err != nil {
 		return err
 	}
-	bar = newIndexProgress(gopts.Quiet, gopts.JSON)
+	bar = newIndexTerminalProgress(printer)
 	debug.Log("Loading destination index")
 	if err := dstRepo.LoadIndex(ctx, bar); err != nil {
 		return err
-	}
-
-	dstSnapshotByOriginal := make(map[restic.ID][]*restic.Snapshot)
-	for sn := range FindFilteredSnapshots(ctx, dstSnapshotLister, dstRepo, &opts.SnapshotFilter, nil) {
-		if sn.Original != nil && !sn.Original.IsNull() {
-			dstSnapshotByOriginal[*sn.Original] = append(dstSnapshotByOriginal[*sn.Original], sn)
-		}
-		// also consider identical snapshot copies
-		dstSnapshotByOriginal[*sn.ID()] = append(dstSnapshotByOriginal[*sn.ID()], sn)
-	}
-	if ctx.Err() != nil {
-		return ctx.Err()
 	}
 
 	rechnker := rechunker.NewRechunker(dstRepo.Config().ChunkerPolynomial)
 	rootTrees := []restic.ID{}
 
 	// first pass: gather all root trees of snapshots for rechunking
-	for sn := range FindFilteredSnapshots(ctx, srcSnapshotLister, srcRepo, &opts.SnapshotFilter, args) {
-		// check whether the destination has a snapshot with the same persistent ID which has similar snapshot fields
-		srcOriginal := *sn.ID()
-		if sn.Original != nil {
-			srcOriginal = *sn.Original
-		}
-
-		if originalSns, ok := dstSnapshotByOriginal[srcOriginal]; ok {
-			isCopy := false
-			for _, originalSn := range originalSns {
-				if similarSnapshots(originalSn, sn) {
-					Verboseff("\n%v\n", sn)
-					Verboseff("skipping source snapshot %s, was already copied to snapshot %s\n", sn.ID().Str(), originalSn.ID().Str())
-					isCopy = true
-					break
-				}
-			}
-			if isCopy {
-				continue
-			}
-		}
-
+	for sn := range FindFilteredSnapshots(ctx, srcSnapshotLister, srcRepo, &opts.SnapshotFilter, args, printer) {
 		rootTrees = append(rootTrees, *sn.Tree)
 	}
 
 	wg, wgCtx := errgroup.WithContext(ctx)
 	dstRepo.StartPackUploader(wgCtx, wg)
-	if err = runRechunk(ctx, srcRepo, rootTrees, dstRepo, rechnker, opts.UsePackCache, gopts.Quiet); err != nil {
+	if err = runRechunk(ctx, srcRepo, rootTrees, dstRepo, rechnker, opts.UsePackCache, printer); err != nil {
 		return err
 	}
 
 	// second pass: rewrite trees
-	Verbosef("Rewriting trees...\n")
-	for sn := range FindFilteredSnapshots(ctx, srcSnapshotLister, srcRepo, &opts.SnapshotFilter, args) {
-		// check whether the destination has a snapshot with the same persistent ID which has similar snapshot fields
-		srcOriginal := *sn.ID()
-		if sn.Original != nil {
-			srcOriginal = *sn.Original
-		}
-
-		if originalSns, ok := dstSnapshotByOriginal[srcOriginal]; ok {
-			isCopy := false
-			for _, originalSn := range originalSns {
-				if similarSnapshots(originalSn, sn) {
-					Verboseff("\n%v\n", sn)
-					Verboseff("skipping source snapshot %s, was already copied to snapshot %s\n", sn.ID().Str(), originalSn.ID().Str())
-					isCopy = true
-					break
-				}
-			}
-			if isCopy {
-				continue
-			}
-		}
-
+	printer.V("Rewriting trees...\n")
+	for sn := range FindFilteredSnapshots(ctx, srcSnapshotLister, srcRepo, &opts.SnapshotFilter, args, printer) {
 		_, err := rechnker.RewriteTree(ctx, srcRepo, dstRepo, *sn.Tree)
 		if err != nil {
 			return err
@@ -195,32 +141,10 @@ func runRechunkCopy(ctx context.Context, opts RechunkCopyOptions, gopts GlobalOp
 		return err
 	}
 
-	Verbosef("Rewriting done.\n\n")
+	printer.V("Rewriting done.\n\n")
 
 	// third pass: write snapshots
-	for sn := range FindFilteredSnapshots(ctx, srcSnapshotLister, srcRepo, &opts.SnapshotFilter, args) {
-		// check whether the destination has a snapshot with the same persistent ID which has similar snapshot fields
-		srcOriginal := *sn.ID()
-		if sn.Original != nil {
-			srcOriginal = *sn.Original
-		}
-
-		if originalSns, ok := dstSnapshotByOriginal[srcOriginal]; ok {
-			isCopy := false
-			for _, originalSn := range originalSns {
-				if similarSnapshots(originalSn, sn) {
-					Verboseff("\n%v\n", sn)
-					Verboseff("skipping source snapshot %s, was already copied to snapshot %s\n", sn.ID().Str(), originalSn.ID().Str())
-					isCopy = true
-					break
-				}
-			}
-			if isCopy {
-				continue
-			}
-		}
-
-		// save snapshot
+	for sn := range FindFilteredSnapshots(ctx, srcSnapshotLister, srcRepo, &opts.SnapshotFilter, args, printer) {
 		sn.Parent = nil // Parent does not have relevance in the new repo.
 		// Use Original as a persistent snapshot ID
 		if sn.Original == nil {
@@ -233,33 +157,34 @@ func runRechunkCopy(ctx context.Context, opts RechunkCopyOptions, gopts GlobalOp
 		}
 		// change Tree field to new one
 		sn.Tree = &newTreeID
-		// add tags if provided
+		// add tags if provided by user
 		sn.AddTags(opts.RechunkTags.Flatten())
 		newID, err := restic.SaveSnapshot(ctx, dstRepo, sn)
 		if err != nil {
 			return err
 		}
-		Verbosef("snapshot %s saved\n", newID.Str())
+		printer.P("snapshot %s saved\n", newID.Str())
 	}
 	return ctx.Err()
 }
 
-func runRechunk(ctx context.Context, srcRepo restic.Repository, roots []restic.ID, dstRepo restic.Repository, rechunker *rechunker.Rechunker, usePackCache bool, quiet bool) error {
-	Verbosef("Rechunk scheduling start...\n")
-	err := rechunker.Plan(ctx, srcRepo, roots, usePackCache)
+func runRechunk(ctx context.Context, srcRepo restic.Repository, roots []restic.ID, dstRepo restic.Repository, rechnker *rechunker.Rechunker, usePackCache bool, printer progress.Printer) error {
+	printer.V("Rechunk scheduling start...\n")
+	err := rechnker.Plan(ctx, srcRepo, roots, usePackCache)
 	if err != nil {
 		return err
 	}
-	Verbosef("Scheduling Done. Rechunking data...\n")
+	printer.V("Scheduling Done. Rechunking data...\n")
 
-	bar := newProgressMax(!quiet, uint64(rechunker.NumFilesToProcess()), "distinct files rechunked")
-	err = rechunker.RechunkData(ctx, srcRepo, dstRepo, bar)
+	bar := printer.NewCounter("distinct files rechunked")
+	bar.SetMax(uint64(rechnker.NumFilesToProcess()))
+	err = rechnker.RechunkData(ctx, srcRepo, dstRepo, bar)
 	if err != nil {
 		return err
 	}
 	bar.Done()
 
-	Verbosef("Rechunking done.\n\n")
+	printer.V("Rechunking done.\n\n")
 
 	return nil
 }
