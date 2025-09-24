@@ -20,11 +20,6 @@ parameters is recommended.
 that `rechunk-copy` additionally supports a `--rechunk-tag` option to add a
 tag to all rechunk-copied snapshots in the destination repository.
 
-# The last section is a list of issue, PR and forum URLs.
-# The first issue ID determines the filename for the changelog entry:
-# changelog/unreleased/issue-1234. If there are no relevant issue links,
-# use the PR ID and call the file pull-55555.
-
 https://github.com/restic/restic/issues/5473
-(PR url)
 https://forum.restic.net/t/is-it-possible-to-re-chunk-after-a-restic-copy/6072
+https://forum.restic.net/t/copy-snapshots-between-repositories-without-copy-chunker-params/7320
