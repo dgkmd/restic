@@ -215,12 +215,12 @@ func (rc *Rechunker) RechunkData(ctx context.Context, srcRepo PackedBlobLoader, 
 
 	wgMgr, wgMgrCtx := errgroup.WithContext(ctx)
 	wgWkr, wgWkrCtx := errgroup.WithContext(ctx)
-	numWorkers := min(runtime.GOMAXPROCS(0), 8)
+	numWorkers := max(runtime.GOMAXPROCS(0)/4, 1)
 
 	// pack cache
 	var cache *PackCache
 	var blobGet func(blobID restic.ID, buf []byte) ([]byte, error)
-	numDownloaders := min(numWorkers, 2)
+	numDownloaders := min(numWorkers, 4)
 	var priorityFilesList []restic.IDs
 	var priorityFilesListLock sync.Mutex
 

@@ -97,7 +97,7 @@ func TestRechunkerRechunkData(t *testing.T) {
 		"2": rtest.Random(4, 20_000_000),
 		"3": rtest.Random(5, 100_000_000),
 	}
-	files["2_duplicate"] = files["3"]
+	files["2_duplicate"] = files["2"]
 	prefixChanged := make([]byte, 0, 100_500_000)
 	prefixChanged = append(prefixChanged, rtest.Random(6, 1_000_000)...)
 	prefixChanged = append(prefixChanged, files["3"][500_000:]...)

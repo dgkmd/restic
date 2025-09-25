@@ -151,7 +151,7 @@ func (cd *ChunkDict) Store(srcBlobs restic.IDs, startOffset, endOffset uint, dst
 
 //////////
 
-const LRU_SIZE = 100
+const LRU_SIZE = 200
 
 type PackLRU = *lru.Cache[restic.ID, []restic.ID]
 
