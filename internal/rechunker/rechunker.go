@@ -8,13 +8,18 @@ import (
 	"fmt"
 	"io"
 	"runtime"
+	"strings"
 	"sync"
 
 	"github.com/restic/chunker"
+	"github.com/restic/restic/internal/debug"
 	"github.com/restic/restic/internal/restic"
 	"github.com/restic/restic/internal/ui/progress"
 	"golang.org/x/sync/errgroup"
 )
+
+// data structure for debug trace
+var debugNote = map[string]int{}
 
 type hashType = [32]byte
 type fileInfo struct {
@@ -215,7 +220,7 @@ func (rc *Rechunker) RechunkData(ctx context.Context, srcRepo PackedBlobLoader, 
 
 	wgMgr, wgMgrCtx := errgroup.WithContext(ctx)
 	wgWkr, wgWkrCtx := errgroup.WithContext(ctx)
-	numWorkers := max(runtime.GOMAXPROCS(0)/4, 1)
+	numWorkers := runtime.GOMAXPROCS(0)
 
 	// pack cache
 	var cache *PackCache
@@ -245,6 +250,10 @@ func (rc *Rechunker) RechunkData(ctx context.Context, srcRepo PackedBlobLoader, 
 			}
 			return blobData, nil
 		}, func(packID restic.ID) {
+			// debug trace
+			debug.Log("pack %v loaded", packID.Str())
+			debugNote["load:"+packID.String()]++
+
 			// onPackReady implementation
 			filesToUpdate := rc.sfPackToFiles[packID]
 			var readyFiles []restic.IDs
@@ -264,6 +273,10 @@ func (rc *Rechunker) RechunkData(ctx context.Context, srcRepo PackedBlobLoader, 
 			priorityFilesList = append(priorityFilesList, readyFiles...)
 			priorityFilesListLock.Unlock()
 		}, func(packID restic.ID) {
+			// debug trace
+			debug.Log("pack %v evicted", packID.Str())
+			debugNote["evict:"+packID.String()]++
+
 			// onPackEvict implementation
 			filesToUpdate := rc.sfPackToFiles[packID]
 			rc.sfPackRequiresLock.Lock()
@@ -421,7 +434,12 @@ func (rc *Rechunker) RechunkData(ctx context.Context, srcRepo PackedBlobLoader, 
 
 					// prefix match
 					prefixBlobs, numFinishedBlobs, newOffset := rc.chunkDict.Match(srcBlobs, 0)
-					if len(prefixBlobs) > 0 {
+					if numFinishedBlobs > 0 {
+						// debug trace
+						debug.Log("chunkDict match at %v (prefix): Skipping %d blobs", srcBlobs[0].Str(), numFinishedBlobs)
+						debugNote["chunkdict_event"]++
+						debugNote["chunkdict_blob_count"] += numFinishedBlobs
+
 						prefixIdx = numFinishedBlobs
 						prefixPos = blobPos[numFinishedBlobs] + newOffset
 						dstBlobs = prefixBlobs
@@ -644,6 +662,11 @@ func (rc *Rechunker) RechunkData(ctx context.Context, srcRepo PackedBlobLoader, 
 							currOffset := currPos - blobPos[currIdx]
 							matchedDstBlobs, numFinishedSrcBlobs, newOffset := rc.chunkDict.Match(srcBlobs[currIdx:], currOffset)
 							if numFinishedSrcBlobs > 4 { // apply only when you can skip many blobs; otherwise, it would be better not to interrupt the pipeline
+								// debug trace
+								debug.Log("ChunkDict match at %v: skipping %d blobs", srcBlobs[currIdx].Str(), numFinishedSrcBlobs)
+								debugNote["chunkdict_event"]++
+								debugNote["chunkdict_blob_count"] += numFinishedSrcBlobs
+
 								dstBlobs = append(dstBlobs, matchedDstBlobs...)
 
 								currIdx += numFinishedSrcBlobs
@@ -688,6 +711,26 @@ func (rc *Rechunker) RechunkData(ctx context.Context, srcRepo PackedBlobLoader, 
 		cache.Close()
 	}
 	err = wgMgr.Wait()
+	if err != nil {
+		return err
+	}
+
+	// debug trace
+	if rc.usePackCache {
+		debug.Log("[report_packcache] list of packs downloaded more than once:")
+		numPackRedundant := 0
+		redundantDownloadCount := 0
+		for k := range debugNote {
+			if strings.HasPrefix(k, "load:") && debugNote[k] > 1 {
+				debug.Log("%v: downloaded %d times, evicted %d times", k[5:15], debugNote[k], debugNote["evict:"+k[5:]])
+				numPackRedundant++
+				redundantDownloadCount += debugNote[k]
+			}
+		}
+		debug.Log("[summary_packcache] number of redundantly downloaded packs is %d, whose overall download count is %d", numPackRedundant, redundantDownloadCount)
+	}
+	debug.Log("[summary_chunkdict] chunkDict match happend %d times, saving %d blob processings", debugNote["chunkdict_event"], debugNote["chunkdict_blob_count"])
+
 	return err
 }
 
