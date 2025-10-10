@@ -269,9 +269,6 @@ func (pc *PackCache) Get(ctx context.Context, wg *errgroup.Group, id restic.ID, 
 	wg.Go(func() error {
 		packID := pc.blobToPack[id]
 
-		// debug trace
-		debug.Log("cache miss of blob %v. request download of pack %v...", id.Str(), packID.Str())
-
 		pc.packWaiterLock.Lock()
 		chWaiter, ok := pc.packWaiter[packID]
 		if !ok {
@@ -280,6 +277,9 @@ func (pc *PackCache) Get(ctx context.Context, wg *errgroup.Group, id restic.ID, 
 		}
 		pc.packWaiterLock.Unlock()
 		if !ok {
+			// debug trace
+			debug.Log("Cache miss: blob %v. Requesting download: pack %v...", id.Str(), packID.Str())
+
 			select {
 			case <-ctx.Done():
 				return ctx.Err()
