@@ -7,7 +7,6 @@ import (
 	"testing"
 
 	rtest "github.com/restic/restic/internal/test"
-	"github.com/restic/restic/internal/ui"
 )
 
 // Reference: cmd_copy_integration_test.go (v0.18.0)
@@ -26,8 +25,8 @@ func testRunRechunkCopy(t testing.TB, srcGopts GlobalOptions, dstGopts GlobalOpt
 		isIntegrationTest: true,
 	}
 
-	rtest.OK(t, withTermStatus(gopts, func(ctx context.Context, term ui.Terminal) error {
-		return runRechunkCopy(context.TODO(), rechunkCopyOpts, gopts, nil, term)
+	rtest.OK(t, withTermStatus(t, gopts, func(ctx context.Context, gopts GlobalOptions) error {
+		return runRechunkCopy(context.TODO(), rechunkCopyOpts, gopts, nil, gopts.term)
 	}))
 }
 
@@ -51,8 +50,8 @@ func TestRechunkCopy(t *testing.T) {
 	copiedSnapshotIDs := testListSnapshots(t, env2.gopts, 3)
 
 	// Check that the copies size seems reasonable
-	stat := dirStats(env.repo)
-	stat2 := dirStats(env2.repo)
+	stat := dirStats(t, env.repo)
+	stat2 := dirStats(t, env2.repo)
 	sizeDiff := int64(stat.size) - int64(stat2.size)
 	if sizeDiff < 0 {
 		sizeDiff = -sizeDiff
@@ -75,7 +74,7 @@ func TestRechunkCopy(t *testing.T) {
 		testRunRestore(t, env2.gopts, restoredir, snapshotID.String())
 		foundMatch := false
 		for cmpdir := range origRestores {
-			diff := directoriesContentsDiff(restoredir, cmpdir)
+			diff := directoriesContentsDiff(t, restoredir, cmpdir)
 			if diff == "" {
 				delete(origRestores, cmpdir)
 				foundMatch = true

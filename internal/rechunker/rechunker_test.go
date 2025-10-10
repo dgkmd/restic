@@ -11,6 +11,7 @@ import (
 
 	"github.com/restic/chunker"
 
+	"github.com/restic/restic/internal/data"
 	"github.com/restic/restic/internal/restic"
 	rtest "github.com/restic/restic/internal/test"
 )
@@ -250,7 +251,7 @@ func generateBlobIDsPair(nSrc, nDst uint) BlobIDsPair {
 type TreeMap map[restic.ID][]byte
 type TestTree map[string]interface{}
 type TestContentNode struct {
-	Type    restic.NodeType
+	Type    data.NodeType
 	Size    uint64
 	Content restic.IDs
 }
@@ -282,7 +283,7 @@ func BuildTreeMap(tree TestTree) (m TreeMap, root restic.ID) {
 }
 
 func buildTreeMap(tree TestTree, m TreeMap) restic.ID {
-	tb := restic.NewTreeJSONBuilder()
+	tb := data.NewTreeJSONBuilder()
 	var names []string
 	for name := range tree {
 		names = append(names, name)
@@ -294,16 +295,16 @@ func buildTreeMap(tree TestTree, m TreeMap) restic.ID {
 		switch elem := item.(type) {
 		case TestTree:
 			id := buildTreeMap(elem, m)
-			err := tb.AddNode(&restic.Node{
+			err := tb.AddNode(&data.Node{
 				Name:    name,
 				Subtree: &id,
-				Type:    restic.NodeTypeDir,
+				Type:    data.NodeTypeDir,
 			})
 			if err != nil {
 				panic(err)
 			}
 		case TestContentNode:
-			err := tb.AddNode(&restic.Node{
+			err := tb.AddNode(&data.Node{
 				Name:    name,
 				Type:    elem.Type,
 				Size:    elem.Size,
@@ -345,68 +346,68 @@ func TestRechunkerRewriteTree(t *testing.T) {
 
 	tree := TestTree{
 		"zerofile": TestContentNode{
-			Type:    restic.NodeTypeFile,
+			Type:    data.NodeTypeFile,
 			Size:    0,
 			Content: restic.IDs{},
 		},
 		"a": TestContentNode{
-			Type:    restic.NodeTypeFile,
+			Type:    data.NodeTypeFile,
 			Size:    1,
 			Content: blobIDsMap["a"].srcBlobIDs,
 		},
 		"subdir": TestTree{
 			"a": TestContentNode{
-				Type:    restic.NodeTypeFile,
+				Type:    data.NodeTypeFile,
 				Size:    3,
 				Content: blobIDsMap["subdir/a"].srcBlobIDs,
 			},
 			"x": TestContentNode{
-				Type:    restic.NodeTypeFile,
+				Type:    data.NodeTypeFile,
 				Size:    2,
 				Content: blobIDsMap["x"].srcBlobIDs,
 			},
 			"subdir": TestTree{
 				"dup_x": TestContentNode{
-					Type:    restic.NodeTypeFile,
+					Type:    data.NodeTypeFile,
 					Size:    2,
 					Content: blobIDsMap["x"].srcBlobIDs,
 				},
 				"nonregularfile": TestContentNode{
-					Type: restic.NodeTypeSymlink,
+					Type: data.NodeTypeSymlink,
 				},
 			},
 		},
 	}
 	wants := TestTree{
 		"zerofile": TestContentNode{
-			Type:    restic.NodeTypeFile,
+			Type:    data.NodeTypeFile,
 			Size:    0,
 			Content: restic.IDs{},
 		},
 		"a": TestContentNode{
-			Type:    restic.NodeTypeFile,
+			Type:    data.NodeTypeFile,
 			Size:    1,
 			Content: blobIDsMap["a"].dstBlobIDs,
 		},
 		"subdir": TestTree{
 			"a": TestContentNode{
-				Type:    restic.NodeTypeFile,
+				Type:    data.NodeTypeFile,
 				Size:    3,
 				Content: blobIDsMap["subdir/a"].dstBlobIDs,
 			},
 			"x": TestContentNode{
-				Type:    restic.NodeTypeFile,
+				Type:    data.NodeTypeFile,
 				Size:    2,
 				Content: blobIDsMap["x"].dstBlobIDs,
 			},
 			"subdir": TestTree{
 				"dup_x": TestContentNode{
-					Type:    restic.NodeTypeFile,
+					Type:    data.NodeTypeFile,
 					Size:    2,
 					Content: blobIDsMap["x"].dstBlobIDs,
 				},
 				"nonregularfile": TestContentNode{
-					Type: restic.NodeTypeSymlink,
+					Type: data.NodeTypeSymlink,
 				},
 			},
 		},

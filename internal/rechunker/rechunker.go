@@ -12,6 +12,7 @@ import (
 	"sync"
 
 	"github.com/restic/chunker"
+	"github.com/restic/restic/internal/data"
 	"github.com/restic/restic/internal/debug"
 	"github.com/restic/restic/internal/restic"
 	"github.com/restic/restic/internal/ui/progress"
@@ -159,7 +160,7 @@ func (rc *Rechunker) Plan(ctx context.Context, srcRepo restic.Repository, rootTr
 	}
 
 	wg, wgCtx := errgroup.WithContext(ctx)
-	treeStream := restic.StreamTrees(wgCtx, wg, srcRepo, rootTrees, func(id restic.ID) bool {
+	treeStream := data.StreamTrees(wgCtx, wg, srcRepo, rootTrees, func(id restic.ID) bool {
 		visited := visitedTrees.Has(id)
 		visitedTrees.Insert(id)
 		return visited
@@ -183,7 +184,7 @@ func (rc *Rechunker) Plan(ctx context.Context, srcRepo restic.Repository, rootTr
 			}
 
 			for _, node := range tree.Nodes {
-				if node.Type == restic.NodeTypeFile {
+				if node.Type == data.NodeTypeFile {
 					hashval := hashOfIDs(node.Content)
 					if _, ok := visitedFiles[hashval]; ok {
 						continue
@@ -734,8 +735,8 @@ func (rc *Rechunker) RechunkData(ctx context.Context, srcRepo PackedBlobLoader, 
 	return err
 }
 
-func (rc *Rechunker) rewriteNode(node *restic.Node) error {
-	if node.Type != restic.NodeTypeFile {
+func (rc *Rechunker) rewriteNode(node *data.Node) error {
+	if node.Type != data.NodeTypeFile {
 		return nil
 	}
 
@@ -755,12 +756,12 @@ func (rc *Rechunker) RewriteTree(ctx context.Context, srcRepo restic.BlobLoader,
 		return newID, nil
 	}
 
-	curTree, err := restic.LoadTree(ctx, srcRepo, nodeID)
+	curTree, err := data.LoadTree(ctx, srcRepo, nodeID)
 	if err != nil {
 		return restic.ID{}, err
 	}
 
-	tb := restic.NewTreeJSONBuilder()
+	tb := data.NewTreeJSONBuilder()
 	for _, node := range curTree.Nodes {
 		if ctx.Err() != nil {
 			return restic.ID{}, ctx.Err()
@@ -771,7 +772,7 @@ func (rc *Rechunker) RewriteTree(ctx context.Context, srcRepo restic.BlobLoader,
 			return restic.ID{}, err
 		}
 
-		if node.Type != restic.NodeTypeDir {
+		if node.Type != data.NodeTypeDir {
 			err = tb.AddNode(node)
 			if err != nil {
 				return restic.ID{}, err

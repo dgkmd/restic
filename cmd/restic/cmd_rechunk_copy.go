@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 
+	"github.com/restic/restic/internal/data"
 	"github.com/restic/restic/internal/debug"
 	"github.com/restic/restic/internal/errors"
 	"github.com/restic/restic/internal/feature"
@@ -18,7 +19,7 @@ import (
 
 // Reference: cmd_copy.go (v0.18.0)
 
-func newRechunkCopyCommand() *cobra.Command {
+func newRechunkCopyCommand(globalOptions *GlobalOptions) *cobra.Command {
 	var opts RechunkCopyOptions
 	cmd := &cobra.Command{
 		Use:   "rechunk-copy [flags] [snapshotID ...]",
@@ -26,11 +27,13 @@ func newRechunkCopyCommand() *cobra.Command {
 		Long: `
 The "rechunk-copy" command rechunk-copies one or more snapshots from one repository to another.
 
-Data blobs stored in the destination repo are rechunked, and tree blobs in the destination repo are also updated accordingly.
+Data blobs will be rechunked and stored in the destination repo. 
+Tree blobs in the destination repo are also updated to point to the rechunked data blobs, 
+but it does not modify any other metadata.
 
 NOTE: This command has largely different internal mechanism from "copy" command,
-due to restic's content defined chunking (CDC) design. Note that "rechunk-copy"
-may consume significantly more bandwidth during the process compared to "copy", 
+due to restic's content defined chunking (CDC) algorithm. Note that "rechunk-copy"
+could consume significantly more bandwidth during the process compared to "copy", 
 and may also need significantly more time to finish.
 
 EXIT STATUS
@@ -45,9 +48,8 @@ Exit status is 12 if the password is incorrect.
 		GroupID:           cmdGroupDefault,
 		DisableAutoGenTag: true,
 		RunE: func(cmd *cobra.Command, args []string) error {
-			term, cancel := setupTermstatus()
-			defer cancel()
-			return runRechunkCopy(cmd.Context(), opts, globalOptions, args, term)
+			finalizeSnapshotFilter(&opts.SnapshotFilter)
+			return runRechunkCopy(cmd.Context(), opts, *globalOptions, args, globalOptions.term)
 		},
 	}
 
@@ -58,8 +60,8 @@ Exit status is 12 if the password is incorrect.
 // RechunkCopyOptions bundles all options for the rechunk-copy command.
 type RechunkCopyOptions struct {
 	secondaryRepoOptions
-	restic.SnapshotFilter
-	RechunkTags       restic.TagLists
+	data.SnapshotFilter
+	RechunkTags       data.TagLists
 	UsePackCache      bool
 	isIntegrationTest bool // skip check for RESTIC_FEATURES=rechunk-copy when integration test
 }
@@ -76,8 +78,8 @@ func runRechunkCopy(ctx context.Context, opts RechunkCopyOptions, gopts GlobalOp
 		return errors.Fatal("rechunk-copy feature flag is not set. Currently, rechunk-copy is alpha feature (disabled by default).")
 	}
 
-	printer := newTerminalProgressPrinter(false, gopts.verbosity, term)
-	secondaryGopts, isFromRepo, err := fillSecondaryGlobalOpts(ctx, opts.secondaryRepoOptions, gopts, "destination", printer)
+	printer := ui.NewProgressPrinter(false, gopts.verbosity, term)
+	secondaryGopts, isFromRepo, err := fillSecondaryGlobalOpts(ctx, opts.secondaryRepoOptions, gopts, "destination")
 	if err != nil {
 		return err
 	}
@@ -104,13 +106,11 @@ func runRechunkCopy(ctx context.Context, opts RechunkCopyOptions, gopts GlobalOp
 	}
 
 	debug.Log("Loading source index")
-	bar := newIndexTerminalProgress(printer)
-	if err := srcRepo.LoadIndex(ctx, bar); err != nil {
+	if err := srcRepo.LoadIndex(ctx, printer); err != nil {
 		return err
 	}
-	bar = newIndexTerminalProgress(printer)
 	debug.Log("Loading destination index")
-	if err := dstRepo.LoadIndex(ctx, bar); err != nil {
+	if err := dstRepo.LoadIndex(ctx, printer); err != nil {
 		return err
 	}
 
@@ -159,7 +159,7 @@ func runRechunkCopy(ctx context.Context, opts RechunkCopyOptions, gopts GlobalOp
 		sn.Tree = &newTreeID
 		// add tags if provided by user
 		sn.AddTags(opts.RechunkTags.Flatten())
-		newID, err := restic.SaveSnapshot(ctx, dstRepo, sn)
+		newID, err := data.SaveSnapshot(ctx, dstRepo, sn)
 		if err != nil {
 			return err
 		}
