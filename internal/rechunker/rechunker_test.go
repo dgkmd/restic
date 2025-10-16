@@ -205,7 +205,7 @@ func TestRechunkerRechunkData(t *testing.T) {
 	}
 	rtest.OK(t, rechunker2.RechunkData(ctx, srcRepo, rechunkTestRepo2, nil))
 
-	// compare test result (by rechunker) vs dstWantsChunkedFiles (ordinary chunking)
+	// compare test result (by rechunker) vs dstWantsChunkedFiles (ordinary backup)
 	testResult1 := rechunker1.rechunkMap
 	testResult2 := rechunker2.rechunkMap
 	for name, srcBlobs := range srcFileIndex {
@@ -339,7 +339,7 @@ func TestRechunkerRewriteTree(t *testing.T) {
 		"x":        generateBlobIDsPair(42, 41),
 		"0":        generateBlobIDsPair(0, 0),
 	}
-	rechunkBlobsMap := map[hashType]restic.IDs{}
+	rechunkBlobsMap := map[restic.ID]restic.IDs{}
 	for _, v := range blobIDsMap {
 		rechunkBlobsMap[hashOfIDs(v.srcBlobIDs)] = v.dstBlobIDs
 	}
