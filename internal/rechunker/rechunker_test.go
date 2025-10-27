@@ -115,9 +115,9 @@ func TestRechunkerRechunkData(t *testing.T) {
 	rechunkStore1 := restic.IDSet{}
 	rechunkStore2 := restic.IDSet{}
 
-	srcFilesList := []restic.IDs{}
+	srcFilesList := []chunkedFile{}
 	for _, file := range srcFileIndex {
-		srcFilesList = append(srcFilesList, file)
+		srcFilesList = append(srcFilesList, chunkedFile{file, hashOfIDs(file)})
 	}
 	srcBlobToPack := simulatedPack(srcChunkStore)
 

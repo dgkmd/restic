@@ -1,6 +1,7 @@
 package rechunker
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/json"
@@ -8,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"runtime"
+	"slices"
 	"strings"
 	"sync"
 
@@ -67,7 +69,7 @@ type Rechunker struct {
 	pol       chunker.Pol
 	chunkDict *ChunkDict
 
-	filesList    []restic.IDs
+	filesList    []chunkedFile
 	blobSize     map[restic.ID]uint
 	rechunkReady bool
 	usePackCache bool
@@ -78,7 +80,7 @@ type Rechunker struct {
 	sfPackToFiles         map[restic.ID][]chunkedFile // pack ID -> list of files{srcBlobIDs, hashOfIDs} that contains any blob in the pack (small files only)
 	sfPackRequires        map[restic.ID]int           // hashOfIDs of srcBlobIDs -> number of packs until all blobs become ready in the cache (small files only)
 	sfPackRequiresLock    sync.Mutex
-	priorityFilesList     []restic.IDs
+	priorityFilesList     []chunkedFile
 	priorityFilesListLock sync.Mutex
 
 	// used in RewriteTree
@@ -114,7 +116,7 @@ func (rc *Rechunker) buildIndex(usePackCache bool, lookupBlobFn func(t restic.Bl
 	// collect all required blobs
 	allBlobs := restic.IDSet{}
 	for _, file := range rc.filesList {
-		for _, blob := range file {
+		for _, blob := range file.IDs {
 			allBlobs.Insert(blob)
 		}
 	}
@@ -128,10 +130,8 @@ func (rc *Rechunker) buildIndex(usePackCache bool, lookupBlobFn func(t restic.Bl
 		pb := packs[0]
 
 		rc.blobSize[pb.Blob.ID] = pb.DataLength()
-		if usePackCache {
-			rc.blobToPack[pb.Blob.ID] = pb.PackID
-			rc.packToBlobs[pb.PackID] = append(rc.packToBlobs[pb.PackID], pb.Blob)
-		}
+		rc.blobToPack[pb.Blob.ID] = pb.PackID
+		rc.packToBlobs[pb.PackID] = append(rc.packToBlobs[pb.PackID], pb.Blob)
 	}
 
 	if !usePackCache { // nothing more to do
@@ -140,18 +140,17 @@ func (rc *Rechunker) buildIndex(usePackCache bool, lookupBlobFn func(t restic.Bl
 
 	// build file<->pack info for small files
 	for _, file := range rc.filesList {
-		if len(file) >= SMALL_FILE_THRESHOLD {
+		if file.Len() >= SMALL_FILE_THRESHOLD {
 			continue
 		}
-		hashval := hashOfIDs(file)
 		packSet := restic.IDSet{}
-		for _, blob := range file {
+		for _, blob := range file.IDs {
 			pack := rc.blobToPack[blob]
 			packSet.Insert(pack)
 		}
-		rc.sfPackRequires[hashval] = len(packSet)
+		rc.sfPackRequires[file.hashval] = len(packSet)
 		for p := range packSet {
-			rc.sfPackToFiles[p] = append(rc.sfPackToFiles[p], chunkedFile{file, hashval})
+			rc.sfPackToFiles[p] = append(rc.sfPackToFiles[p], file)
 		}
 	}
 
@@ -204,7 +203,10 @@ func (rc *Rechunker) Plan(ctx context.Context, srcRepo restic.Repository, rootTr
 					}
 					visitedFiles[hashval] = struct{}{}
 
-					rc.filesList = append(rc.filesList, node.Content)
+					rc.filesList = append(rc.filesList, chunkedFile{
+						node.Content,
+						hashval,
+					})
 				}
 			}
 		}
@@ -220,18 +222,45 @@ func (rc *Rechunker) Plan(ctx context.Context, srcRepo restic.Repository, rootTr
 		return err
 	}
 
+	// sort filesList by lexicographic pack order
+	filesPacksMap := map[restic.ID][]byte{}
+	maxFilePacksLength := 0
+	maxFileLength := 0
+	for _, file := range rc.filesList {
+		var filePacks restic.IDs
+		var currPack restic.ID
+		for _, b := range file.IDs {
+			p := rc.blobToPack[b]
+			if currPack != p {
+				currPack = p
+				filePacks = append(filePacks, currPack)
+			}
+		}
+		if maxFilePacksLength < filePacks.Len() {
+			maxFilePacksLength = filePacks.Len()
+			maxFileLength = file.Len()
+		}
+		filesPacksMap[file.hashval] = concatIDs(filePacks)
+	}
+	slices.SortFunc(rc.filesList, func(a, b chunkedFile) int {
+		ap := filesPacksMap[a.hashval]
+		bp := filesPacksMap[b.hashval]
+		return bytes.Compare(ap, bp)
+	})
+	debug.Log("Max number of filePacks: %v, whose length is %v", maxFilePacksLength, maxFileLength)
+
 	rc.usePackCache = usePackCache
 	rc.rechunkReady = true
 
 	return nil
 }
 
-func startFileStreamer(ctx context.Context, wg *errgroup.Group, file restic.IDs, out chan<- fileStreamReader, getBlob getBlobFn, bufferPool chan []byte) {
+func startFileStreamer(ctx context.Context, wg *errgroup.Group, srcBlobs restic.IDs, out chan<- fileStreamReader, getBlob getBlobFn, bufferPool chan []byte) {
 	ch := make(chan []byte)
 
 	// loader: load file chunks sequentially
 	wg.Go(func() error {
-		for i := 0; i < len(file); i++ {
+		for i := 0; i < len(srcBlobs); i++ {
 			// bring buffer from bufferPool
 			var buf []byte
 			select {
@@ -241,7 +270,7 @@ func startFileStreamer(ctx context.Context, wg *errgroup.Group, file restic.IDs,
 			}
 
 			// get chunk data (may take a while)
-			buf, err := getBlob(file[i], buf)
+			buf, err := getBlob(srcBlobs[i], buf)
 			if err != nil {
 				return err
 			}
@@ -297,7 +326,7 @@ func startFileStreamer(ctx context.Context, wg *errgroup.Group, file restic.IDs,
 	})
 }
 
-func startFileStreamerWithFastForward(ctx context.Context, wg *errgroup.Group, file restic.IDs, out chan<- fileStreamReader, getBlob getBlobFn, bufferPool chan []byte, ff <-chan fastForward) {
+func startFileStreamerWithFastForward(ctx context.Context, wg *errgroup.Group, srcBlobs restic.IDs, out chan<- fileStreamReader, getBlob getBlobFn, bufferPool chan []byte, ff <-chan fastForward) {
 	type blob struct {
 		buf   []byte
 		stNum int
@@ -310,14 +339,14 @@ func startFileStreamerWithFastForward(ctx context.Context, wg *errgroup.Group, f
 		var offset uint
 
 	MainLoop:
-		for i := 0; i < len(file); i++ {
+		for i := 0; i < len(srcBlobs); i++ {
 			// check if a fast-forward request has arrived
 			select {
 			case ffPos := <-ff:
 				stNum = ffPos.newStNum
 				i = ffPos.blobIdx
 				offset = ffPos.offset
-				if i >= len(file) { // implies EOF
+				if i >= len(srcBlobs) { // implies EOF
 					break MainLoop
 				}
 			default:
@@ -332,7 +361,7 @@ func startFileStreamerWithFastForward(ctx context.Context, wg *errgroup.Group, f
 			}
 
 			// get chunk data (may take a while)
-			buf, err := getBlob(file[i], buf)
+			buf, err := getBlob(srcBlobs[i], buf)
 			if err != nil {
 				return err
 			}
@@ -632,14 +661,14 @@ func (rc *Rechunker) newCache(ctx context.Context, wg *errgroup.Group, srcRepo P
 
 		// onPackReady implementation
 		filesToUpdate := rc.sfPackToFiles[packID]
-		var readyFiles []restic.IDs
+		var readyFiles []chunkedFile
 
 		rc.sfPackRequiresLock.Lock()
 		for _, file := range filesToUpdate {
 			if rc.sfPackRequires[file.hashval] > 0 {
 				rc.sfPackRequires[file.hashval]--
 				if rc.sfPackRequires[file.hashval] == 0 {
-					readyFiles = append(readyFiles, file.IDs)
+					readyFiles = append(readyFiles, file)
 				}
 			}
 		}
@@ -674,7 +703,7 @@ func (rc *Rechunker) runDispatcher(ctx context.Context, wg *errgroup.Group) chan
 		wg.Go(func() error {
 			seenFiles := map[restic.ID]struct{}{}
 			regularTrack := rc.filesList
-			var fastTrack []restic.IDs
+			var fastTrack []chunkedFile
 
 			for {
 				if len(fastTrack) == 0 {
@@ -689,30 +718,28 @@ func (rc *Rechunker) runDispatcher(ctx context.Context, wg *errgroup.Group) chan
 				if len(fastTrack) > 0 {
 					file := fastTrack[0]
 					fastTrack = fastTrack[1:]
-					hashval := hashOfIDs(file)
-					if _, ok := seenFiles[hashval]; ok {
+					if _, ok := seenFiles[file.hashval]; ok {
 						continue
 					}
-					seenFiles[hashval] = struct{}{}
+					seenFiles[file.hashval] = struct{}{}
 
 					select {
 					case <-ctx.Done():
 						return ctx.Err()
-					case chDispatch <- file:
+					case chDispatch <- file.IDs:
 					}
 				} else if len(regularTrack) > 0 {
 					file := regularTrack[0]
 					regularTrack = regularTrack[1:]
-					hashval := hashOfIDs(file)
-					if _, ok := seenFiles[hashval]; ok {
+					if _, ok := seenFiles[file.hashval]; ok {
 						continue
 					}
-					seenFiles[hashval] = struct{}{}
+					seenFiles[file.hashval] = struct{}{}
 
 					select {
 					case <-ctx.Done():
 						return ctx.Err()
-					case chDispatch <- file:
+					case chDispatch <- file.IDs:
 					}
 				} else { // no more jobs
 					close(chDispatch)
@@ -726,7 +753,7 @@ func (rc *Rechunker) runDispatcher(ctx context.Context, wg *errgroup.Group) chan
 				select {
 				case <-ctx.Done():
 					return ctx.Err()
-				case chDispatch <- file:
+				case chDispatch <- file.IDs:
 				}
 			}
 			close(chDispatch)
@@ -1022,4 +1049,12 @@ func hashOfIDs(ids restic.IDs) restic.ID {
 		c = append(c, id[:]...)
 	}
 	return sha256.Sum256(c)
+}
+
+func concatIDs(ids restic.IDs) []byte {
+	c := make([]byte, 0, len(ids)*32)
+	for _, id := range ids {
+		c = append(c, id[:]...)
+	}
+	return c
 }
