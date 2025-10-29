@@ -62,7 +62,7 @@ type RechunkCopyOptions struct {
 	secondaryRepoOptions
 	data.SnapshotFilter
 	RechunkTags       data.TagLists
-	UsePackCache      bool
+	CacheSize         int
 	isIntegrationTest bool // skip check for RESTIC_FEATURES=rechunk-copy when integration test
 }
 
@@ -70,12 +70,15 @@ func (opts *RechunkCopyOptions) AddFlags(f *pflag.FlagSet) {
 	opts.secondaryRepoOptions.AddFlags(f, "destination", "to copy snapshots from")
 	initMultiSnapshotFilter(f, &opts.SnapshotFilter, true)
 	f.Var(&opts.RechunkTags, "rechunk-tag", "add `tags` for the copied snapshots in the format `tag[,tag,...]` (can be specified multiple times)")
-	f.BoolVar(&opts.UsePackCache, "use-pack-cache", false, "use pack cache for remote source repository")
+	f.IntVar(&opts.CacheSize, "cache-size", 4096, "in-memory blob cache size in MiBs (0 to disable)")
 }
 
 func runRechunkCopy(ctx context.Context, opts RechunkCopyOptions, gopts GlobalOptions, args []string, term ui.Terminal) error {
 	if !feature.Flag.Enabled(feature.RechunkCopy) && !opts.isIntegrationTest {
 		return errors.Fatal("rechunk-copy feature flag is not set. Currently, rechunk-copy is alpha feature (disabled by default).")
+	}
+	if opts.CacheSize != 0 && opts.CacheSize < 100 {
+		return errors.Fatal("blob cache size must be at least 100 MiB")
 	}
 
 	printer := ui.NewProgressPrinter(false, gopts.verbosity, term)
@@ -126,7 +129,7 @@ func runRechunkCopy(ctx context.Context, opts RechunkCopyOptions, gopts GlobalOp
 
 	wg, wgCtx := errgroup.WithContext(ctx)
 	dstRepo.StartPackUploader(wgCtx, wg)
-	if err = runRechunk(ctx, srcRepo, rootTrees, dstRepo, rechnker, opts.UsePackCache, printer); err != nil {
+	if err = runRechunk(ctx, srcRepo, rootTrees, dstRepo, rechnker, opts.CacheSize*(1<<20), printer); err != nil {
 		return err
 	}
 
@@ -172,10 +175,10 @@ func runRechunkCopy(ctx context.Context, opts RechunkCopyOptions, gopts GlobalOp
 	return ctx.Err()
 }
 
-func runRechunk(ctx context.Context, srcRepo restic.Repository, roots []restic.ID, dstRepo restic.Repository, rechnker *rechunker.Rechunker, usePackCache bool, printer progress.Printer) error {
+func runRechunk(ctx context.Context, srcRepo restic.Repository, roots []restic.ID, dstRepo restic.Repository, rechnker *rechunker.Rechunker, cacheSize int, printer progress.Printer) error {
 	printer.V("Preparing rechunking...\n")
 	debug.Log("Running Plan()")
-	err := rechnker.Plan(ctx, srcRepo, roots, usePackCache)
+	err := rechnker.Plan(ctx, srcRepo, roots, cacheSize != 0)
 	if err != nil {
 		return err
 	}
@@ -183,7 +186,7 @@ func runRechunk(ctx context.Context, srcRepo restic.Repository, roots []restic.I
 	bar := printer.NewCounter("distinct files rechunked")
 	bar.SetMax(uint64(rechnker.NumFilesToProcess()))
 	debug.Log("Running RechunkData()")
-	err = rechnker.RechunkData(ctx, srcRepo, dstRepo, bar)
+	err = rechnker.RechunkData(ctx, srcRepo, dstRepo, cacheSize, bar)
 	if err != nil {
 		return err
 	}

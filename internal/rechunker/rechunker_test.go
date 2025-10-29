@@ -115,9 +115,9 @@ func TestRechunkerRechunkData(t *testing.T) {
 	rechunkStore1 := restic.IDSet{}
 	rechunkStore2 := restic.IDSet{}
 
-	srcFilesList := []chunkedFile{}
+	srcFilesList := []*chunkedFile{}
 	for _, file := range srcFileIndex {
-		srcFilesList = append(srcFilesList, chunkedFile{file, hashOfIDs(file)})
+		srcFilesList = append(srcFilesList, &chunkedFile{file, hashOfIDs(file)})
 	}
 	srcBlobToPack := simulatedPack(srcChunkStore)
 
@@ -175,7 +175,7 @@ func TestRechunkerRechunkData(t *testing.T) {
 			return
 		},
 	}
-	rtest.OK(t, rechunker1.RechunkData(ctx, srcRepo, rechunkTestRepo1, nil))
+	rtest.OK(t, rechunker1.RechunkData(ctx, srcRepo, rechunkTestRepo1, 0, nil))
 
 	// test 2: rechunking with cache
 	rechunker2 := NewRechunker(dstChunkerParam)
@@ -190,7 +190,7 @@ func TestRechunkerRechunkData(t *testing.T) {
 
 		return []restic.PackedBlob{pb}
 	}))
-	rechunker2.usePackCache = true
+	rechunker2.useBlobCache = true
 	rechunker2.rechunkReady = true
 
 	saveBlobLock2 := sync.Mutex{}
@@ -203,7 +203,7 @@ func TestRechunkerRechunkData(t *testing.T) {
 			return
 		},
 	}
-	rtest.OK(t, rechunker2.RechunkData(ctx, srcRepo, rechunkTestRepo2, nil))
+	rtest.OK(t, rechunker2.RechunkData(ctx, srcRepo, rechunkTestRepo2, 4096*(1<<20), nil))
 
 	// compare test result (by rechunker) vs dstWantsChunkedFiles (ordinary backup)
 	testResult1 := rechunker1.rechunkMap
