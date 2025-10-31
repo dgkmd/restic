@@ -885,11 +885,11 @@ func (rc *Rechunker) RechunkData(ctx context.Context, srcRepo PackedBlobLoader, 
 
 	wgBg, wgBgCtx := errgroup.WithContext(ctx)
 	wgFg, wgFgCtx := errgroup.WithContext(ctx)
-	numWorkers := min(runtime.GOMAXPROCS(0), 4)
+	numWorkers := runtime.GOMAXPROCS(0)
 
 	// pack cache
 	var getBlob getBlobFn
-	numDownloaders := numWorkers
+	numDownloaders := min(numWorkers, 4)
 
 	debug.Log("Creating blob cache")
 	if rc.useBlobCache {
