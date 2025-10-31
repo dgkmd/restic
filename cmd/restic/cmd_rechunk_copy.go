@@ -7,6 +7,7 @@ import (
 	"github.com/restic/restic/internal/debug"
 	"github.com/restic/restic/internal/errors"
 	"github.com/restic/restic/internal/feature"
+	"github.com/restic/restic/internal/global"
 	"github.com/restic/restic/internal/rechunker"
 	"github.com/restic/restic/internal/restic"
 	"github.com/restic/restic/internal/ui"
@@ -19,7 +20,7 @@ import (
 
 // Reference: cmd_copy.go (v0.18.0)
 
-func newRechunkCopyCommand(globalOptions *GlobalOptions) *cobra.Command {
+func newRechunkCopyCommand(globalOptions *global.Options) *cobra.Command {
 	var opts RechunkCopyOptions
 	cmd := &cobra.Command{
 		Use:   "rechunk-copy [flags] [snapshotID ...]",
@@ -49,7 +50,7 @@ Exit status is 12 if the password is incorrect.
 		DisableAutoGenTag: true,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			finalizeSnapshotFilter(&opts.SnapshotFilter)
-			return runRechunkCopy(cmd.Context(), opts, *globalOptions, args, globalOptions.term)
+			return runRechunkCopy(cmd.Context(), opts, *globalOptions, args, globalOptions.Term)
 		},
 	}
 
@@ -59,7 +60,7 @@ Exit status is 12 if the password is incorrect.
 
 // RechunkCopyOptions bundles all options for the rechunk-copy command.
 type RechunkCopyOptions struct {
-	secondaryRepoOptions
+	global.SecondaryRepoOptions
 	data.SnapshotFilter
 	RechunkTags       data.TagLists
 	CacheSize         int
@@ -67,13 +68,13 @@ type RechunkCopyOptions struct {
 }
 
 func (opts *RechunkCopyOptions) AddFlags(f *pflag.FlagSet) {
-	opts.secondaryRepoOptions.AddFlags(f, "destination", "to copy snapshots from")
+	opts.SecondaryRepoOptions.AddFlags(f, "destination", "to copy snapshots from")
 	initMultiSnapshotFilter(f, &opts.SnapshotFilter, true)
 	f.Var(&opts.RechunkTags, "rechunk-tag", "add `tags` for the copied snapshots in the format `tag[,tag,...]` (can be specified multiple times)")
 	f.IntVar(&opts.CacheSize, "cache-size", 4096, "in-memory blob cache size in MiBs (0 to disable)")
 }
 
-func runRechunkCopy(ctx context.Context, opts RechunkCopyOptions, gopts GlobalOptions, args []string, term ui.Terminal) error {
+func runRechunkCopy(ctx context.Context, opts RechunkCopyOptions, gopts global.Options, args []string, term ui.Terminal) error {
 	if !feature.Flag.Enabled(feature.RechunkCopy) && !opts.isIntegrationTest {
 		return errors.Fatal("rechunk-copy feature flag is not set. Currently, rechunk-copy is alpha feature (disabled by default).")
 	}
@@ -81,8 +82,8 @@ func runRechunkCopy(ctx context.Context, opts RechunkCopyOptions, gopts GlobalOp
 		return errors.Fatal("blob cache size must be at least 100 MiB")
 	}
 
-	printer := ui.NewProgressPrinter(false, gopts.verbosity, term)
-	secondaryGopts, isFromRepo, err := fillSecondaryGlobalOpts(ctx, opts.secondaryRepoOptions, gopts, "destination")
+	printer := ui.NewProgressPrinter(false, gopts.Verbosity, term)
+	secondaryGopts, isFromRepo, err := opts.SecondaryRepoOptions.FillGlobalOpts(ctx, gopts, "destination")
 	if err != nil {
 		return err
 	}
