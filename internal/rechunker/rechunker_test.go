@@ -115,9 +115,9 @@ func TestRechunkerRechunkData(t *testing.T) {
 	rechunkStore1 := restic.IDSet{}
 	rechunkStore2 := restic.IDSet{}
 
-	srcFilesList := []*chunkedFile{}
+	srcFilesList := []*ChunkedFile{}
 	for _, file := range srcFileIndex {
-		srcFilesList = append(srcFilesList, &chunkedFile{file, hashOfIDs(file)})
+		srcFilesList = append(srcFilesList, &ChunkedFile{file, hashOfIDs(file)})
 	}
 	srcBlobToPack := simulatedPack(srcChunkStore)
 
@@ -190,7 +190,6 @@ func TestRechunkerRechunkData(t *testing.T) {
 
 		return []restic.PackedBlob{pb}
 	}))
-	rechunker2.useBlobCache = true
 	rechunker2.rechunkReady = true
 
 	saveBlobLock2 := sync.Mutex{}

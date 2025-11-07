@@ -34,7 +34,7 @@ type BlobCache struct {
 	blobToPack  map[restic.ID]restic.ID // readonly: map from blob ID to pack ID the blob resides in
 	packToBlobs map[restic.ID][]restic.Blob
 
-	closed chan struct{}
+	done chan struct{}
 }
 
 func NewBlobCache(ctx context.Context, wg *errgroup.Group, size int, numDownloaders int,
@@ -53,7 +53,7 @@ func NewBlobCache(ctx context.Context, wg *errgroup.Group, size int, numDownload
 		ignores:     restic.IDSet{},
 		blobToPack:  blobToPack,
 		packToBlobs: packToBlobs,
-		closed:      make(chan struct{}),
+		done:        make(chan struct{}),
 	}
 	lru, err := simplelru.NewLRU(size, func(k restic.ID, v []byte) {
 		c.free += cap(v) + overhead
@@ -91,7 +91,7 @@ func NewBlobCache(ctx context.Context, wg *errgroup.Group, size int, numDownload
 				select {
 				case <-ctx.Done():
 					return ctx.Err()
-				case <-c.closed:
+				case <-c.done:
 					return nil
 				case packID = <-c.downloadCh:
 				}
@@ -153,7 +153,7 @@ func NewBlobCache(ctx context.Context, wg *errgroup.Group, size int, numDownload
 			select {
 			case <-ctx.Done():
 				return ctx.Err()
-			case <-c.closed:
+			case <-c.done:
 				return nil
 			case ids = <-c.evictCh:
 			}
@@ -277,8 +277,13 @@ func (c *BlobCache) Ignore(ctx context.Context, blobs restic.IDs) error {
 }
 
 func (c *BlobCache) Close() {
-	var once sync.Once
-	once.Do(func() {
-		close(c.closed)
-	})
+	if c == nil {
+		return
+	}
+
+	select {
+	case <-c.done:
+	default:
+		close(c.done)
+	}
 }
