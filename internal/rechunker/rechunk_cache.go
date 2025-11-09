@@ -38,7 +38,7 @@ type BlobCache struct {
 }
 
 func NewBlobCache(ctx context.Context, wg *errgroup.Group, size int, numDownloaders int,
-	blobToPack map[restic.ID]restic.ID, packToBlobs map[restic.ID][]restic.Blob, repo PackedBlobLoader, onReady func(blobIDs restic.IDs),
+	blobToPack map[restic.ID]restic.ID, packToBlobs map[restic.ID][]restic.Blob, repo restic.Repository, onReady func(blobIDs restic.IDs),
 	onEvict func(blobIDs restic.IDs)) *BlobCache {
 	if size < 32*(1<<20) {
 		panic("Blob cache size should be at least 32 MiB!!")

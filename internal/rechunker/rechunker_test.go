@@ -117,7 +117,7 @@ func TestRechunkerRechunkData(t *testing.T) {
 
 	srcFilesList := []*ChunkedFile{}
 	for _, file := range srcFileIndex {
-		srcFilesList = append(srcFilesList, &ChunkedFile{file, hashOfIDs(file)})
+		srcFilesList = append(srcFilesList, &ChunkedFile{file, HashOfIDs(file)})
 	}
 	srcBlobToPack := simulatedPack(srcChunkStore)
 
@@ -208,12 +208,12 @@ func TestRechunkerRechunkData(t *testing.T) {
 	testResult1 := rechunker1.rechunkMap
 	testResult2 := rechunker2.rechunkMap
 	for name, srcBlobs := range srcFileIndex {
-		hashval := hashOfIDs(srcBlobs)
-		wants := hashOfIDs(dstWantsFileIndex[name])
-		if hashOfIDs(testResult1[hashval]) != wants {
+		hashval := HashOfIDs(srcBlobs)
+		wants := HashOfIDs(dstWantsFileIndex[name])
+		if HashOfIDs(testResult1[hashval]) != wants {
 			t.Errorf("rechunk test 1 mismatch for file '%v'", name)
 		}
-		if hashOfIDs(testResult2[hashval]) != wants {
+		if HashOfIDs(testResult2[hashval]) != wants {
 			t.Errorf("rechunk test 2 mismatch for file '%v'", name)
 		}
 	}
@@ -340,7 +340,7 @@ func TestRechunkerRewriteTree(t *testing.T) {
 	}
 	rechunkBlobsMap := map[restic.ID]restic.IDs{}
 	for _, v := range blobIDsMap {
-		rechunkBlobsMap[hashOfIDs(v.srcBlobIDs)] = v.dstBlobIDs
+		rechunkBlobsMap[HashOfIDs(v.srcBlobIDs)] = v.dstBlobIDs
 	}
 
 	tree := TestTree{

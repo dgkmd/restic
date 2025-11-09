@@ -41,11 +41,6 @@ type ChunkedFileContext struct {
 	prefixIdx   int
 }
 
-type PackedBlobLoader interface {
-	LoadBlob(ctx context.Context, t restic.BlobType, id restic.ID, buf []byte) ([]byte, error)
-	LoadBlobsFromPack(ctx context.Context, packID restic.ID, blobs []restic.Blob, handleBlobFn func(blob restic.BlobHandle, buf []byte, err error) error) error
-}
-
 // PriorityFilesHandler is a wrapper for priority files (which are readily available in the blob cache).
 type PriorityFilesHandler struct {
 	filesList []*ChunkedFile
@@ -250,7 +245,7 @@ func (rc *Rechunker) Plan(ctx context.Context, srcRepo restic.Repository, rootTr
 
 			for _, node := range tree.Nodes {
 				if node.Type == data.NodeTypeFile {
-					hashval := hashOfIDs(node.Content)
+					hashval := HashOfIDs(node.Content)
 					if visitedFiles.Has(hashval) {
 						continue
 					}
@@ -285,7 +280,7 @@ func (rc *Rechunker) Plan(ctx context.Context, srcRepo restic.Repository, rootTr
 	return nil
 }
 
-func (rc *Rechunker) runCache(ctx context.Context, wg *errgroup.Group, srcRepo PackedBlobLoader, numDownloaders int, cacheSize int) {
+func (rc *Rechunker) runCache(ctx context.Context, wg *errgroup.Group, srcRepo restic.Repository, numDownloaders int, cacheSize int) {
 	rc.priorityFilesHandler = NewPriorityFilesHandler()
 
 	rc.cache = NewBlobCache(ctx, wg, cacheSize, numDownloaders, rc.blobToPack, rc.packToBlobs, srcRepo,
@@ -564,7 +559,7 @@ func (rc *Rechunker) runWorkers(ctx context.Context, wg *errgroup.Group, numWork
 				dstBlobs = append(dstBlobs, <-chDstBlobs...)
 
 				// register to rechunkMap
-				hashval := hashOfIDs(srcBlobs)
+				hashval := HashOfIDs(srcBlobs)
 				rc.rechunkMapLock.Lock()
 				rc.rechunkMap[hashval] = dstBlobs
 				rc.rechunkMapLock.Unlock()
@@ -604,7 +599,7 @@ func (rc *Rechunker) fileComplete(ctx context.Context, srcBlobs restic.IDs) erro
 	return nil
 }
 
-func (rc *Rechunker) RechunkData(ctx context.Context, srcRepo PackedBlobLoader, dstRepo restic.BlobSaver, cacheSize int, p *progress.Counter) error {
+func (rc *Rechunker) RechunkData(ctx context.Context, srcRepo restic.Repository, dstRepo restic.BlobSaver, cacheSize int, p *progress.Counter) error {
 	if !rc.rechunkReady {
 		return fmt.Errorf("Plan() must be run first before RechunkData()")
 	}
@@ -618,7 +613,7 @@ func (rc *Rechunker) RechunkData(ctx context.Context, srcRepo PackedBlobLoader, 
 	var getBlob getBlobFn
 	if cacheSize > 0 {
 		debug.Log("Creating blob cache: cacheSize %v", cacheSize)
-		numDownloaders := min(numWorkers, 4)
+		numDownloaders := min(numWorkers, int(srcRepo.Connections()))
 		rc.runCache(wgBgCtx, wgBg, srcRepo, numDownloaders, cacheSize)
 		// implement getBlob with the blob cache as an intermediary
 		getBlob = func(blobID restic.ID, buf []byte, prefetch restic.IDs) ([]byte, error) {
@@ -693,7 +688,7 @@ func (rc *Rechunker) rewriteNode(node *data.Node) error {
 		return nil
 	}
 
-	hashval := hashOfIDs(node.Content)
+	hashval := HashOfIDs(node.Content)
 	dstBlobs, ok := rc.rechunkMap[hashval]
 	if !ok {
 		return fmt.Errorf("can't find from rechunkBlobsMap: %v", node.Content.String())
@@ -768,7 +763,7 @@ func (rc *Rechunker) GetRewrittenTree(originalTree restic.ID) (restic.ID, error)
 	return newID, nil
 }
 
-func hashOfIDs(ids restic.IDs) restic.ID {
+func HashOfIDs(ids restic.IDs) restic.ID {
 	c := make([]byte, 0, len(ids)*32)
 	for _, id := range ids {
 		c = append(c, id[:]...)
