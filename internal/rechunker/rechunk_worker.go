@@ -31,6 +31,93 @@ type fastForward struct {
 
 var ErrNewStream = errors.New("new stream")
 
+func prioritySelect(ctx context.Context, chFirst <-chan *ChunkedFile, chSecond <-chan *ChunkedFile) (file *ChunkedFile, ok bool, err error) {
+	if chSecond != nil {
+		// Firstly, try chFirst only. If chFirst is not ready now, wait for both chFirst and chSecond.
+		select {
+		case <-ctx.Done():
+			return nil, false, ctx.Err()
+		case file, ok = <-chFirst:
+		default:
+			select {
+			case <-ctx.Done():
+				return nil, false, ctx.Err()
+			case file, ok = <-chFirst:
+			case file, ok = <-chSecond:
+			}
+		}
+	} else {
+		select {
+		case <-ctx.Done():
+			return nil, false, ctx.Err()
+		case file, ok = <-chFirst:
+		}
+	}
+
+	return file, ok, nil
+}
+
+func prepareChunkDict(ctx context.Context, wg *errgroup.Group, srcBlobs restic.IDs, d *ChunkDict, idx *RechunkerIndex) (info *ChunkedFileContext, ff *fastForward, prefix restic.IDs) {
+	// build blobPos (position of each blob in a file)
+	blobPos := make([]uint, len(srcBlobs)+1)
+	var offset uint
+	for i, blob := range srcBlobs {
+		offset += idx.blobSize[blob]
+		blobPos[i+1] = offset
+	}
+	if blobPos[1] == 0 { // assertion
+		panic("blobPos not computed correctly")
+	}
+
+	// define seekBlobPos
+	seekBlobPos := func(pos uint, seekStartIdx int) (int, uint) {
+		if pos < blobPos[seekStartIdx] { // invalid pos
+			return -1, 0
+		}
+		i := seekStartIdx
+		for i < len(srcBlobs) && pos >= blobPos[i+1] {
+			i++
+		}
+		offset := pos - blobPos[i]
+
+		return i, offset
+	}
+
+	// prefix match
+	prefix, numFinishedBlobs, newOffset := d.Match(srcBlobs, 0)
+	var prefixIdx int
+	var prefixPos uint
+	if numFinishedBlobs > 0 {
+		// debugNote: record chunkdict prefix match event
+		debug.Log("ChunkDict match at %v (prefix): Skipping %d blobs", srcBlobs[0].Str(), numFinishedBlobs)
+		debugNoteLock.Lock()
+		debugNote["chunkdict_event"]++
+		debugNote["chunkdict_blob_count"] += numFinishedBlobs
+		debugNoteLock.Unlock()
+
+		prefixIdx = numFinishedBlobs
+		prefixPos = blobPos[prefixIdx] + newOffset
+
+		ff = &fastForward{
+			newStNum: 0,
+			blobIdx:  prefixIdx,
+			offset:   newOffset,
+		}
+	}
+
+	info = &ChunkedFileContext{
+		srcBlobs:    srcBlobs,
+		blobPos:     blobPos,
+		seekBlobPos: seekBlobPos,
+		dictStore:   d.Store,
+		dictMatch:   d.Match,
+		prefixPos:   prefixPos,
+		prefixIdx:   prefixIdx,
+	}
+
+	return info, ff, prefix
+}
+
 func startFileStreamer(ctx context.Context, wg *errgroup.Group, srcBlobs restic.IDs, out chan<- fileStreamReader, getBlob getBlobFn, bufferPool chan []byte) {
 	ch := make(chan []byte)
 

@@ -104,6 +104,10 @@ func runRechunkCopy(ctx context.Context, opts RechunkCopyOptions, gopts global.O
 	}
 	defer unlock()
 
+	if srcRepo.Config().ChunkerPolynomial == dstRepo.Config().ChunkerPolynomial {
+		return errors.Fatal("source repo and destination repo have same chunker polynomials; use `restic copy` instead")
+	}
+
 	srcSnapshotLister, err := restic.MemorizeList(ctx, srcRepo, restic.SnapshotFile)
 	if err != nil {
 		return err
@@ -123,13 +127,15 @@ func runRechunkCopy(ctx context.Context, opts RechunkCopyOptions, gopts global.O
 	rootTrees := []restic.ID{}
 
 	// first pass: gather all root trees of snapshots for rechunking
-	debug.Log("Gathering root trees to process")
+	debug.Log("Gathering root trees of target snapshots")
 	for sn := range FindFilteredSnapshots(ctx, srcSnapshotLister, srcRepo, &opts.SnapshotFilter, args, printer) {
 		rootTrees = append(rootTrees, *sn.Tree)
 	}
 
 	wg, wgCtx := errgroup.WithContext(ctx)
+	debug.Log("Starting pack uploader")
 	dstRepo.StartPackUploader(wgCtx, wg)
+	debug.Log("Running runRechunk()")
 	if err = runRechunk(ctx, srcRepo, rootTrees, dstRepo, rechnker, opts.CacheSize*(1<<20), printer); err != nil {
 		return err
 	}
@@ -152,6 +158,7 @@ func runRechunkCopy(ctx context.Context, opts RechunkCopyOptions, gopts global.O
 	printer.V("Rewriting done.\n\n")
 
 	// third pass: write snapshots
+	debug.Log("Writing snapshots")
 	for sn := range FindFilteredSnapshots(ctx, srcSnapshotLister, srcRepo, &opts.SnapshotFilter, args, printer) {
 		sn.Parent = nil // Parent does not have relevance in the new repo.
 		// Use Original as a persistent snapshot ID
@@ -163,6 +170,7 @@ func runRechunkCopy(ctx context.Context, opts RechunkCopyOptions, gopts global.O
 		if err != nil {
 			return err
 		}
+		debug.Log("Snapshot %v: Original root tree %v is substituted with new %v", sn.ID().Str(), sn.Tree.Str(), newTreeID.Str())
 		// change Tree field to new one
 		sn.Tree = &newTreeID
 		// add tags if provided by user
@@ -171,6 +179,7 @@ func runRechunkCopy(ctx context.Context, opts RechunkCopyOptions, gopts global.O
 		if err != nil {
 			return err
 		}
+		debug.Log("Snapshot %v (src repo) is rechunk-copied to snapshot %v (dst repo)", sn.ID().Str(), newID.Str())
 		printer.P("snapshot %s saved\n", newID.Str())
 	}
 	return ctx.Err()

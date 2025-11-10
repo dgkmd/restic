@@ -2,6 +2,7 @@ package rechunker
 
 import (
 	"context"
+	"fmt"
 	"sync"
 
 	"github.com/hashicorp/golang-lru/v2/simplelru"
@@ -252,6 +253,8 @@ func (c *BlobCache) Get(ctx context.Context, wg *errgroup.Group, id restic.ID, b
 				select {
 				case <-ctx.Done():
 					return ctx.Err()
+				case <-c.done:
+					return fmt.Errorf("cache closed")
 				case c.downloadCh <- packID:
 				}
 			}
@@ -260,6 +263,8 @@ func (c *BlobCache) Get(ctx context.Context, wg *errgroup.Group, id restic.ID, b
 			select {
 			case <-ctx.Done():
 				return ctx.Err()
+			case <-c.done:
+				return fmt.Errorf("cache closed")
 			case <-q.waiter:
 			}
 		}
@@ -271,6 +276,8 @@ func (c *BlobCache) Ignore(ctx context.Context, blobs restic.IDs) error {
 	select {
 	case <-ctx.Done():
 		return ctx.Err()
+	case <-c.done:
+		return fmt.Errorf("cache closed")
 	case c.evictCh <- blobs:
 		return nil
 	}
@@ -285,5 +292,82 @@ func (c *BlobCache) Close() {
 	case <-c.done:
 	default:
 		close(c.done)
+	}
+}
+
+// PriorityFilesHandler is a wrapper for priority files (which are readily available in the blob cache).
+type PriorityFilesHandler struct {
+	filesList []*ChunkedFile
+	mu        sync.Mutex
+	arrival   chan struct{} // should be closed iff filesList != nil
+
+	done chan struct{}
+}
+
+func NewPriorityFilesHandler() *PriorityFilesHandler {
+	return &PriorityFilesHandler{
+		arrival: make(chan struct{}),
+		done:    make(chan struct{}),
+	}
+}
+
+func (h *PriorityFilesHandler) Push(files []*ChunkedFile) bool {
+	select {
+	case <-h.done:
+		return false
+	default:
+	}
+
+	h.mu.Lock()
+	defer h.mu.Unlock()
+
+	listWasNil := (h.filesList == nil)
+	h.filesList = append(h.filesList, files...)
+	if listWasNil && h.filesList != nil {
+		close(h.arrival)
+	}
+
+	return true
+}
+
+func (h *PriorityFilesHandler) Arrival() <-chan struct{} {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+
+	return h.arrival
+}
+
+func (h *PriorityFilesHandler) Pop() []*ChunkedFile {
+	select {
+	case <-h.done:
+		return nil
+	default:
+	}
+
+	h.mu.Lock()
+	defer h.mu.Unlock()
+
+	if h.filesList == nil {
+		return nil
+	}
+	l := h.filesList
+	h.filesList = nil
+	h.arrival = make(chan struct{})
+	return l
+}
+
+func (h *PriorityFilesHandler) Done() <-chan struct{} {
+	return h.done
+}
+
+func (h *PriorityFilesHandler) Close() {
+	if h == nil {
+		return
+	}
+
+	select {
+	case <-h.done:
+	default:
+		close(h.done)
 	}
 }

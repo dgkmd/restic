@@ -144,3 +144,14 @@ func (cd *ChunkDict) Store(srcBlobs restic.IDs, startOffset, endOffset uint, dst
 
 	return nil
 }
+
+// ChunkedFileContext has variables and functions needed for use in rechunk workers with ChunkDict.
+type ChunkedFileContext struct {
+	srcBlobs    restic.IDs
+	blobPos     []uint        // file position of each blob's start
+	seekBlobPos seekBlobPosFn // maps file position to blob position
+	dictStore   dictStoreFn
+	dictMatch   dictMatchFn
+	prefixPos   uint
+	prefixIdx   int
+}
