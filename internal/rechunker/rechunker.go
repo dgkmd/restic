@@ -26,9 +26,6 @@ var debugNote = map[string]int{}
 var debugNoteLock = sync.Mutex{}
 
 type getBlobFn func(blobID restic.ID, buf []byte, prefetch restic.IDs) ([]byte, error)
-type seekBlobPosFn func(pos uint, seekStartIdx int) (idx int, offset uint)                                               // given pos in a file, find blob idx and offset
-type dictStoreFn func(srcBlobs restic.IDs, startOffset, endOffset uint, dstBlob restic.ID) error                         // store a blob mapping to ChunkDict
-type dictMatchFn func(srcBlobs restic.IDs, startOffset uint) (dstBlobs restic.IDs, numFinishedBlobs int, newOffset uint) // get matching blob mapping from ChunkDict
 
 type Rechunker struct {
 	pol                  chunker.Pol
@@ -152,11 +149,12 @@ func (rc *Rechunker) RechunkData(ctx context.Context, srcRepo restic.Repository,
 
 	// run workers
 	debug.Log("Running rechunk workers")
+	onBlobLoad := createBlobLoadCallback(ctx, rc.cache, rc.idx)
 	if rc.cache != nil {
-		rc.runWorkers(wgFgCtx, wgFg, numWorkers, getBlob, dstRepo, chPriority, chRegular, p)
-		rc.runWorkers(wgFgCtx, wgFg, 1, getBlob, dstRepo, chPriority, nil, p) // a dedicated worker that only processes priority files
+		rc.runWorkers(wgFgCtx, wgFg, numWorkers, getBlob, dstRepo, chPriority, chRegular, onBlobLoad, p)
+		rc.runWorkers(wgFgCtx, wgFg, 1, getBlob, dstRepo, chPriority, nil, onBlobLoad, p) // a dedicated worker that only processes priority files
 	} else {
-		rc.runWorkers(wgFgCtx, wgFg, numWorkers, getBlob, dstRepo, chRegular, nil, p)
+		rc.runWorkers(wgFgCtx, wgFg, numWorkers, getBlob, dstRepo, chRegular, nil, onBlobLoad, p)
 	}
 
 	// wait for foreground workers to finish
@@ -187,6 +185,7 @@ func (rc *Rechunker) RechunkData(ctx context.Context, srcRepo restic.Repository,
 			}
 		}
 		debug.Log("[summary_blobcache] Number of redundantly downloaded blobs is %d, whose overall download count is %d", numBlobRedundant, redundantDownloadCount)
+		debug.Log("[summary_blobcache] Max memory usage by cache: %v/%v bytes", debugNote["max_cache_usage"], cacheSize)
 	}
 	debug.Log("[summary_chunkdict] ChunkDict match happend %d times, saving %d blob processings", debugNote["chunkdict_event"], debugNote["chunkdict_blob_count"])
 
@@ -216,6 +215,7 @@ func (rc *Rechunker) RewriteTree(ctx context.Context, srcRepo restic.BlobLoader,
 			return restic.ID{}, err
 		}
 
+		// if the node is non-directory node, add it to the tree
 		if node.Type != data.NodeTypeDir {
 			err = tb.AddNode(node)
 			if err != nil {
@@ -224,6 +224,7 @@ func (rc *Rechunker) RewriteTree(ctx context.Context, srcRepo restic.BlobLoader,
 			continue
 		}
 
+		// if the node is directory node, rewrite it recursively
 		subtree := *node.Subtree
 		newID, err := rc.RewriteTree(ctx, srcRepo, dstRepo, subtree)
 		if err != nil {
@@ -241,7 +242,7 @@ func (rc *Rechunker) RewriteTree(ctx context.Context, srcRepo restic.BlobLoader,
 		return restic.ID{}, err
 	}
 
-	// Save new tree
+	// save new tree to the destination repo
 	newTreeID, _, _, err := dstRepo.SaveBlob(ctx, restic.TreeBlob, tree, restic.ID{}, false)
 	rc.rewriteTreeMap[nodeID] = newTreeID
 	return newTreeID, err
@@ -341,7 +342,7 @@ func createIndex(filesList []*ChunkedFile, lookupBlobFn func(t restic.BlobType, 
 		blobRemaining: blobRemaining,
 	}
 
-	if !useBlobCache { // nothing more to do
+	if !useBlobCache { // that's all you need if blob cache is disabled
 		return idx, nil
 	}
 
@@ -540,7 +541,7 @@ func startDispatcher(ctx context.Context, wg *errgroup.Group, filesList []*Chunk
 	return chRegular, chPriority
 }
 
-func (rc *Rechunker) runWorkers(ctx context.Context, wg *errgroup.Group, numWorkers int, getBlob getBlobFn, dstRepo restic.BlobSaver, chFirst <-chan *ChunkedFile, chSecond <-chan *ChunkedFile, p *progress.Counter) {
+func (rc *Rechunker) runWorkers(ctx context.Context, wg *errgroup.Group, numWorkers int, getBlob getBlobFn, dstRepo restic.BlobSaver, chFirst <-chan *ChunkedFile, chSecond <-chan *ChunkedFile, onBlobLoad blobLoadCallbackFn, p *progress.Counter) {
 	if chFirst == nil { // assertion
 		panic("chFirst must not be nil")
 	}
@@ -583,14 +584,14 @@ func (rc *Rechunker) runWorkers(ctx context.Context, wg *errgroup.Group, numWork
 					}
 
 					// start pipeline
-					startFileStreamerWithFastForward(ctxIn, wgIn, srcBlobs, chStreamer, getBlob, bufferPool, chFastForward)
+					startFileStreamerWithFastForward(ctxIn, wgIn, srcBlobs, chStreamer, getBlob, onBlobLoad, bufferPool, chFastForward)
 					startChunker(ctxIn, wgIn, chnker, rc.pol, chStreamer, chChunk, bufferPool)
 					startFileBlobSaverWithFastForward(ctxIn, wgIn, chChunk, chDstBlobs, dstRepo, bufferPool, chFastForward, info)
 				} else {
 					// not using chunkDict; simply stream-process from head to EOF
 
 					// start pipeline
-					startFileStreamer(ctxIn, wgIn, srcBlobs, chStreamer, getBlob, bufferPool)
+					startFileStreamer(ctxIn, wgIn, srcBlobs, chStreamer, getBlob, onBlobLoad, bufferPool)
 					startChunker(ctxIn, wgIn, chnker, rc.pol, chStreamer, chChunk, bufferPool)
 					startFileBlobSaver(ctxIn, wgIn, chChunk, chDstBlobs, dstRepo, bufferPool)
 				}
@@ -611,35 +612,9 @@ func (rc *Rechunker) runWorkers(ctx context.Context, wg *errgroup.Group, numWork
 				if p != nil {
 					p.Add(1)
 				}
-
-				err = fileComplete(ctx, srcBlobs, rc.cache, rc.idx)
-				if err != nil {
-					return err
-				}
 			}
 		})
 	}
-}
-
-func fileComplete(ctx context.Context, srcBlobs restic.IDs, c *BlobCache, idx *RechunkerIndex) error {
-	if c == nil {
-		return nil
-	}
-
-	var ignoresList restic.IDs
-	idx.blobRemainingLock.Lock()
-	for _, blob := range srcBlobs {
-		idx.blobRemaining[blob]--
-		if idx.blobRemaining[blob] == 0 {
-			ignoresList = append(ignoresList, blob)
-		}
-	}
-	idx.blobRemainingLock.Unlock()
-
-	if len(ignoresList) > 0 {
-		return c.Ignore(ctx, ignoresList)
-	}
-	return nil
 }
 
 func (rc *Rechunker) rewriteNode(node *data.Node) error {

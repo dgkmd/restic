@@ -138,11 +138,22 @@ func NewBlobCache(ctx context.Context, wg *errgroup.Group, size int, numDownload
 					delete(c.inProgress, id)
 					blobIDs = append(blobIDs, id)
 				}
+				debugCurrMemUsage := c.size - c.free
 				c.mu.Unlock()
 
 				if onReady != nil {
 					onReady(blobIDs)
 				}
+
+				debug.Log("PackID %v loaded. Current cache usage: %v", packID.Str(), debugCurrMemUsage)
+				debug.Log("Pack %v includes the following blobs: \n%v", packID.Str(), blobIDs.String())
+
+				// debugNote: track maximum memory usage
+				debugNoteLock.Lock()
+				if debugNote["max_cache_usage"] < debugCurrMemUsage {
+					debugNote["max_cache_usage"] = debugCurrMemUsage
+				}
+				debugNoteLock.Unlock()
 			}
 		})
 	}
@@ -165,6 +176,10 @@ func NewBlobCache(ctx context.Context, wg *errgroup.Group, size int, numDownload
 				c.c.Remove(id)
 			}
 			c.mu.Unlock()
+
+			for _, id := range ids {
+				debug.Log("Blob %v is ignored, no longer will be downloaded", id.Str())
+			}
 		}
 	})
 

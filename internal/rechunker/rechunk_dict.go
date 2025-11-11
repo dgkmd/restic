@@ -16,6 +16,21 @@ type connectingLink map[restic.ID]link
 type linkIndex map[uint]link
 type chunkDict map[restic.ID]linkIndex
 
+type seekBlobPosFn func(pos uint, seekStartIdx int) (idx int, offset uint)                                               // given pos in a file, find blob idx and offset
+type dictStoreFn func(srcBlobs restic.IDs, startOffset, endOffset uint, dstBlob restic.ID) error                         // store a blob mapping to ChunkDict
+type dictMatchFn func(srcBlobs restic.IDs, startOffset uint) (dstBlobs restic.IDs, numFinishedBlobs int, newOffset uint) // get matching blob mapping from ChunkDict
+
+// ChunkedFileContext has variables and functions needed for use in rechunk workers with ChunkDict.
+type ChunkedFileContext struct {
+	srcBlobs    restic.IDs
+	blobPos     []uint        // file position of each blob's start
+	seekBlobPos seekBlobPosFn // maps file position to blob position
+	dictStore   dictStoreFn
+	dictMatch   dictMatchFn
+	prefixPos   uint
+	prefixIdx   int
+}
+
 type ChunkDict struct {
 	dict chunkDict
 	lock sync.RWMutex
@@ -143,15 +158,4 @@ func (cd *ChunkDict) Store(srcBlobs restic.IDs, startOffset, endOffset uint, dst
 	}
 
 	return nil
-}
-
-// ChunkedFileContext has variables and functions needed for use in rechunk workers with ChunkDict.
-type ChunkedFileContext struct {
-	srcBlobs    restic.IDs
-	blobPos     []uint        // file position of each blob's start
-	seekBlobPos seekBlobPosFn // maps file position to blob position
-	dictStore   dictStoreFn
-	dictMatch   dictMatchFn
-	prefixPos   uint
-	prefixIdx   int
 }
