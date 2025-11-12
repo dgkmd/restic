@@ -7,14 +7,24 @@ import (
 	"github.com/restic/restic/internal/restic"
 )
 
-type link interface{} // union of {terminalLink, connectingLink}
+// link is union of {terminalLink, connectingLink}.
+type link interface{}
+
+// terminalLink stores chunk mapping target, i.e., (dstBlob, new_offset).
 type terminalLink struct {
 	dstBlob restic.ID
 	offset  uint
 }
+
+// connectingLink connects between two srcBlob.
 type connectingLink map[restic.ID]link
-type linkIndex map[uint]link
-type chunkDict map[restic.ID]linkIndex
+
+// linkTable stores records for a srcBlob's each starting offset.
+type linkTable map[uint]link
+
+// dictIndex is a mapping whose key is the starting srcBlob and
+// the value is a linkTable for that srcBlob.
+type dictIndex map[restic.ID]linkTable
 
 type seekBlobPosFn func(pos uint, seekStartIdx int) (idx int, offset uint)                                               // given pos in a file, find blob idx and offset
 type dictStoreFn func(srcBlobs restic.IDs, startOffset, endOffset uint, dstBlob restic.ID) error                         // store a blob mapping to ChunkDict
@@ -32,13 +42,13 @@ type ChunkedFileContext struct {
 }
 
 type ChunkDict struct {
-	dict chunkDict
-	lock sync.RWMutex
+	idx dictIndex
+	mu  sync.RWMutex
 }
 
 func NewChunkDict() *ChunkDict {
 	return &ChunkDict{
-		dict: chunkDict{},
+		idx: dictIndex{},
 	}
 }
 
@@ -47,11 +57,11 @@ func (cd *ChunkDict) Match(srcBlobs restic.IDs, startOffset uint) (dstBlobs rest
 		return
 	}
 
-	cd.lock.RLock()
-	defer cd.lock.RUnlock()
+	cd.mu.RLock()
+	defer cd.mu.RUnlock()
 
-	lnk, ok := cd.dict[srcBlobs[0]][startOffset]
-	if !ok { // dict entry not found
+	lnk, ok := cd.idx[srcBlobs[0]][startOffset]
+	if !ok { // can't find entry from index
 		return
 	}
 
@@ -67,7 +77,7 @@ func (cd *ChunkDict) Match(srcBlobs restic.IDs, startOffset uint) (dstBlobs rest
 			if len(srcBlobs) == 0 { // EOF
 				return
 			}
-			lnk, ok = cd.dict[srcBlobs[0]][newOffset]
+			lnk, ok = cd.idx[srcBlobs[0]][newOffset]
 			if !ok {
 				return
 			}
@@ -102,35 +112,35 @@ func (cd *ChunkDict) Store(srcBlobs restic.IDs, startOffset, endOffset uint, dst
 		return fmt.Errorf("wrong value. len(srcBlob)==1 and startOffset>endOffset")
 	}
 
-	cd.lock.Lock()
-	defer cd.lock.Unlock()
+	cd.mu.Lock()
+	defer cd.mu.Unlock()
 
-	idx, ok := cd.dict[srcBlobs[0]]
-	if !ok {
-		cd.dict[srcBlobs[0]] = linkIndex{}
-		idx = cd.dict[srcBlobs[0]]
+	table, ok := cd.idx[srcBlobs[0]]
+	if !ok { // can't find table from idx; make new one
+		cd.idx[srcBlobs[0]] = linkTable{}
+		table = cd.idx[srcBlobs[0]]
 	}
 
 	// create link head
 	numConnectingLink := len(srcBlobs) - 1
 	singleTerminalLink := (numConnectingLink == 0)
-	lnk, ok := idx[startOffset]
-	if ok { // index exists; type assertion
+	lnk, ok := table[startOffset]
+	if ok { // table record exists; type assertion
 		if singleTerminalLink {
 			_ = lnk.(terminalLink)
 			return nil // nothing to touch
 		}
 		_ = lnk.(connectingLink)
-	} else { // index does not exist
+	} else { // table record does not exist; make new one
 		if singleTerminalLink {
-			idx[startOffset] = terminalLink{
+			table[startOffset] = terminalLink{
 				dstBlob: dstBlob,
 				offset:  endOffset,
 			}
 			return nil
 		}
-		idx[startOffset] = connectingLink{}
-		lnk = idx[startOffset]
+		table[startOffset] = connectingLink{}
+		lnk = table[startOffset]
 	}
 	srcBlobs = srcBlobs[1:]
 
