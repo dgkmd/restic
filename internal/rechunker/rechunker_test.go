@@ -34,6 +34,9 @@ func (r *TestRechunkerRepo) LoadBlobsFromPack(ctx context.Context, packID restic
 func (r *TestRechunkerRepo) SaveBlob(ctx context.Context, t restic.BlobType, buf []byte, id restic.ID, storeDuplicate bool) (newID restic.ID, known bool, size int, err error) {
 	return r.saveBlob(buf)
 }
+func (r *TestRechunkerRepo) Connections() uint {
+	return 5
+}
 
 // chunk `files` by `pol` and return fileIndex (map from path to blob IDs) and chunkStore (map from blob ID to bytes data)
 func chunkFiles(chnker *chunker.Chunker, pol chunker.Pol, files map[string][]byte) (map[string]restic.IDs, map[restic.ID][]byte) {
@@ -95,7 +98,7 @@ func TestRechunkerRechunkData(t *testing.T) {
 	files := map[string][]byte{
 		"0": {},
 		"1": rtest.Random(1, 10_000),
-		"2": rtest.Random(4, 20_000_000),
+		"2": rtest.Random(4, 10_000_000),
 		"3": rtest.Random(5, 100_000_000),
 	}
 	files["2_duplicate"] = files["2"]
@@ -152,7 +155,6 @@ func TestRechunkerRechunkData(t *testing.T) {
 
 	// test 1: rechunking without cache
 	rechunker1 := NewRechunker(dstChunkerParam)
-	rechunker1.reset()
 	rechunker1.filesList = srcFilesList
 	var err error
 	rechunker1.idx, err = createIndex(srcFilesList, func(t restic.BlobType, id restic.ID) []restic.PackedBlob {
@@ -184,7 +186,6 @@ func TestRechunkerRechunkData(t *testing.T) {
 
 	// test 2: rechunking with cache
 	rechunker2 := NewRechunker(dstChunkerParam)
-	rechunker2.reset()
 	rechunker2.filesList = srcFilesList
 	rechunker2.idx, err = createIndex(srcFilesList, func(t restic.BlobType, id restic.ID) []restic.PackedBlob {
 		pb := restic.PackedBlob{}
@@ -426,7 +427,6 @@ func TestRechunkerRewriteTree(t *testing.T) {
 
 	testsRepo := TreeMap{}
 	rechunker := NewRechunker(0)
-	rechunker.reset()
 	rechunker.rechunkMap = rechunkBlobsMap
 	testsRoot, err := rechunker.RewriteTree(context.TODO(), srcRepo, testsRepo, srcRoot)
 	if err != nil {

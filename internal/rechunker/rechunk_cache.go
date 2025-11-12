@@ -39,7 +39,7 @@ type BlobCache struct {
 }
 
 func NewBlobCache(ctx context.Context, wg *errgroup.Group, size int, numDownloaders int,
-	blobToPack map[restic.ID]restic.ID, packToBlobs map[restic.ID][]restic.Blob, repo restic.Repository, onReady func(blobIDs restic.IDs),
+	blobToPack map[restic.ID]restic.ID, packToBlobs map[restic.ID][]restic.Blob, repo RechunkSrcRepo, onReady func(blobIDs restic.IDs),
 	onEvict func(blobIDs restic.IDs)) *BlobCache {
 	if size < 32*(1<<20) {
 		panic("Blob cache size should be at least 32 MiB!!")
@@ -180,6 +180,11 @@ func NewBlobCache(ctx context.Context, wg *errgroup.Group, size int, numDownload
 			for _, id := range ids {
 				debug.Log("Blob %v is ignored, no longer will be downloaded", id.Str())
 			}
+
+			// debugNote: track the number of ignored blobs
+			debugNoteLock.Lock()
+			debugNote["ignored_blob_count"] += len(ids)
+			debugNoteLock.Unlock()
 		}
 	})
 

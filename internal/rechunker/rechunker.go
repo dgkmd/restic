@@ -28,6 +28,16 @@ var debugNoteLock = sync.Mutex{}
 type getBlobFn func(blobID restic.ID, buf []byte, prefetch restic.IDs) ([]byte, error)
 type saveBlobFn func(buf []byte) (id restic.ID, err error)
 
+type RechunkSrcRepo interface {
+	restic.BlobLoader
+	LoadBlobsFromPack(ctx context.Context, packID restic.ID, blobs []restic.Blob, handleBlobFn func(blob restic.BlobHandle, buf []byte, err error) error) error
+	Connections() uint
+}
+
+type RechunkDstRepo interface {
+	restic.BlobSaver
+}
+
 type Rechunker struct {
 	pol                  chunker.Pol
 	chunkDict            *ChunkDict
@@ -107,7 +117,7 @@ func (rc *Rechunker) Plan(ctx context.Context, srcRepo restic.Repository, rootTr
 	return nil
 }
 
-func (rc *Rechunker) RechunkData(ctx context.Context, srcRepo restic.Repository, dstRepo restic.BlobSaver, cacheSize int, p *progress.Counter) error {
+func (rc *Rechunker) RechunkData(ctx context.Context, srcRepo RechunkSrcRepo, dstRepo RechunkDstRepo, cacheSize int, p *progress.Counter) error {
 	if !rc.rechunkReady {
 		return fmt.Errorf("Plan() must be run first before RechunkData()")
 	}
@@ -166,22 +176,8 @@ func (rc *Rechunker) RechunkData(ctx context.Context, srcRepo restic.Repository,
 	// cleanup cache
 	rc.cache.Close()
 
-	// debugNote: print report
-	if rc.cache != nil {
-		debug.Log("List of blobs downloaded more than once:")
-		numBlobRedundant := 0
-		redundantDownloadCount := 0
-		for k := range debugNote {
-			if strings.HasPrefix(k, "load:") && debugNote[k] > 1 {
-				debug.Log("%v: Downloaded %d times", k[5:15], debugNote[k])
-				numBlobRedundant++
-				redundantDownloadCount += debugNote[k]
-			}
-		}
-		debug.Log("[summary_blobcache] Number of redundantly downloaded blobs is %d, whose overall download count is %d", numBlobRedundant, redundantDownloadCount)
-		debug.Log("[summary_blobcache] Max memory usage by cache: %v/%v bytes", debugNote["max_cache_usage"], cacheSize)
-	}
-	debug.Log("[summary_chunkdict] ChunkDict match happend %d times, saving %d blob processings", debugNote["chunkdict_event"], debugNote["chunkdict_blob_count"])
+	// print debug.Log report
+	debugPrintRechunkReport(rc)
 
 	return nil
 }
@@ -252,11 +248,11 @@ func (rc *Rechunker) reset() {
 	rc.idx = nil
 }
 
-func gatherFileContents(ctx context.Context, srcRepo restic.Repository, rootTrees restic.IDs, visitedFiles restic.IDSet, visitedTrees restic.IDSet) (filesList []*ChunkedFile, err error) {
+func gatherFileContents(ctx context.Context, repo restic.Repository, rootTrees restic.IDs, visitedFiles restic.IDSet, visitedTrees restic.IDSet) (filesList []*ChunkedFile, err error) {
 	wg, wgCtx := errgroup.WithContext(ctx)
 
 	// create StreamTrees channel that streams through all subtrees in target snapshots
-	treeStream := data.StreamTrees(wgCtx, wg, srcRepo, rootTrees, func(id restic.ID) bool {
+	treeStream := data.StreamTrees(wgCtx, wg, repo, rootTrees, func(id restic.ID) bool {
 		visited := visitedTrees.Has(id)
 		visitedTrees.Insert(id)
 		return visited
@@ -304,7 +300,7 @@ func gatherFileContents(ctx context.Context, srcRepo restic.Repository, rootTree
 	return filesList, nil
 }
 
-func createIndex(filesList []*ChunkedFile, lookupBlobFn func(t restic.BlobType, id restic.ID) []restic.PackedBlob, useBlobCache bool) (idx *RechunkerIndex, err error) {
+func createIndex(filesList []*ChunkedFile, lookupBlob func(t restic.BlobType, id restic.ID) []restic.PackedBlob, useBlobCache bool) (idx *RechunkerIndex, err error) {
 	// collect blob usage info
 	blobRemaining := map[restic.ID]int{}
 	for _, file := range filesList {
@@ -313,12 +309,15 @@ func createIndex(filesList []*ChunkedFile, lookupBlobFn func(t restic.BlobType, 
 		}
 	}
 
+	// debugNote: record the number of blobs used
+	debugNote["total_blob_count"] = len(blobRemaining)
+
 	// build blob lookup info
 	blobSize := map[restic.ID]uint{}
 	blobToPack := map[restic.ID]restic.ID{}
 	packToBlobs := map[restic.ID][]restic.Blob{}
 	for blob := range blobRemaining {
-		packs := lookupBlobFn(restic.DataBlob, blob)
+		packs := lookupBlob(restic.DataBlob, blob)
 		if len(packs) == 0 {
 			return nil, fmt.Errorf("can't find blob from source repo: %v", blob)
 		}
@@ -364,7 +363,7 @@ func createIndex(filesList []*ChunkedFile, lookupBlobFn func(t restic.BlobType, 
 	return idx, nil
 }
 
-func startCache(ctx context.Context, srcRepo restic.Repository, idx *RechunkerIndex, numDownloaders int, cacheSize int) (*BlobCache, *PriorityFilesHandler) {
+func startCache(ctx context.Context, srcRepo RechunkSrcRepo, idx *RechunkerIndex, numDownloaders int, cacheSize int) (*BlobCache, *PriorityFilesHandler) {
 	debug.Log("Initiating priorityFilesHandler")
 	priorityFilesHandler := NewPriorityFilesHandler()
 
@@ -635,4 +634,26 @@ func HashOfIDs(ids restic.IDs) restic.ID {
 		c = append(c, id[:]...)
 	}
 	return sha256.Sum256(c)
+}
+
+func debugPrintRechunkReport(rc *Rechunker) {
+	if rc.cache != nil {
+		debug.Log("List of blobs downloaded more than once:")
+		numBlobRedundant := 0
+		redundantDownloadCount := 0
+		for k := range debugNote {
+			if strings.HasPrefix(k, "load:") && debugNote[k] > 1 {
+				debug.Log("%v: Downloaded %d times", k[5:15], debugNote[k])
+				numBlobRedundant++
+				redundantDownloadCount += debugNote[k]
+			}
+		}
+		debug.Log("[summary_blobcache] Number of redundantly downloaded blobs is %d, whose overall download count is %d", numBlobRedundant, redundantDownloadCount)
+		debug.Log("[summary_blobcache] Peak memory usage by blob cache: %v/%v bytes", debugNote["max_cache_usage"], rc.cache.size)
+		if debugNote["total_blob_count"] != debugNote["ignored_blob_count"] {
+			debug.Log("[summary_blobcache] WARNING: Number of successfully ignored blob at the end: %v/%v", debugNote["ignored_blob_count"], debugNote["total_blob_count"])
+		}
+	}
+	debug.Log("[summary_chunkdict] ChunkDict match happend %d times, saving %d blob processings", debugNote["chunkdict_event"], debugNote["chunkdict_blob_count"])
+
 }
