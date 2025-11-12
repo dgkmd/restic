@@ -154,7 +154,8 @@ func TestRechunkerRechunkData(t *testing.T) {
 	rechunker1 := NewRechunker(dstChunkerParam)
 	rechunker1.reset()
 	rechunker1.filesList = srcFilesList
-	rtest.OK(t, rechunker1.buildIndex(false, func(t restic.BlobType, id restic.ID) []restic.PackedBlob {
+	var err error
+	rechunker1.idx, err = createIndex(srcFilesList, func(t restic.BlobType, id restic.ID) []restic.PackedBlob {
 		pb := restic.PackedBlob{}
 		pb.ID = id
 		pb.Type = t
@@ -162,7 +163,11 @@ func TestRechunkerRechunkData(t *testing.T) {
 		pb.PackID = srcBlobToPack[id]
 
 		return []restic.PackedBlob{pb}
-	}))
+	}, false)
+	if err != nil {
+		panic(err)
+	}
+
 	rechunker1.rechunkReady = true
 
 	saveBlobLock1 := sync.Mutex{}
@@ -181,7 +186,7 @@ func TestRechunkerRechunkData(t *testing.T) {
 	rechunker2 := NewRechunker(dstChunkerParam)
 	rechunker2.reset()
 	rechunker2.filesList = srcFilesList
-	rtest.OK(t, rechunker2.buildIndex(true, func(t restic.BlobType, id restic.ID) []restic.PackedBlob {
+	rechunker2.idx, err = createIndex(srcFilesList, func(t restic.BlobType, id restic.ID) []restic.PackedBlob {
 		pb := restic.PackedBlob{}
 		pb.ID = id
 		pb.Type = t
@@ -189,7 +194,11 @@ func TestRechunkerRechunkData(t *testing.T) {
 		pb.PackID = srcBlobToPack[id]
 
 		return []restic.PackedBlob{pb}
-	}))
+	}, true)
+	if err != nil {
+		panic(err)
+	}
+
 	rechunker2.rechunkReady = true
 
 	saveBlobLock2 := sync.Mutex{}

@@ -26,6 +26,7 @@ var debugNote = map[string]int{}
 var debugNoteLock = sync.Mutex{}
 
 type getBlobFn func(blobID restic.ID, buf []byte, prefetch restic.IDs) ([]byte, error)
+type saveBlobFn func(buf []byte) (id restic.ID, err error)
 
 type Rechunker struct {
 	pol                  chunker.Pol
@@ -112,65 +113,58 @@ func (rc *Rechunker) RechunkData(ctx context.Context, srcRepo restic.Repository,
 	}
 	rc.rechunkReady = false
 
-	wgBg, wgBgCtx := errgroup.WithContext(ctx) // workgroup for background workers (cache, dispatchers)
-	wgFg, wgFgCtx := errgroup.WithContext(ctx) // workgroup for foreground workers (rechunk workers, blob downloaders)
 	numWorkers := min(runtime.GOMAXPROCS(0), int(srcRepo.Connections()))
 	debug.Log("srcRepo.Connections(): %v", srcRepo.Connections())
 
-	// prepare blob cache and getBlob function
+	// prepare blob cache and create getBlob function
 	var getBlob getBlobFn
 	if cacheSize > 0 {
 		debug.Log("Creating blob cache: cacheSize %v", cacheSize)
 		numDownloaders := numWorkers
-		rc.cache, rc.priorityFilesHandler = startCache(wgBgCtx, wgBg, srcRepo, rc.idx, numDownloaders, cacheSize)
+		rc.cache, rc.priorityFilesHandler = startCache(ctx, srcRepo, rc.idx, numDownloaders, cacheSize)
 		// define getBlob with the blob cache as an intermediary
-		getBlob = func(blobID restic.ID, buf []byte, prefetch restic.IDs) ([]byte, error) {
-			blob, ch := rc.cache.Get(wgFgCtx, wgFg, blobID, buf, prefetch)
-			if blob == nil { // wait for blob to be downloaded
-				select {
-				case <-wgFgCtx.Done():
-					return nil, wgFgCtx.Err()
-				case blob = <-ch:
-				}
-			}
-			return blob, nil
-		}
+		getBlob = createGetBlobFn(ctx, rc.cache)
 	} else {
 		// if the blob cache is disabled, getblob directly uses srcRepo's LoadBlob()
 		getBlob = func(blobID restic.ID, buf []byte, _ restic.IDs) ([]byte, error) {
-			return srcRepo.LoadBlob(wgFgCtx, restic.DataBlob, blobID, buf)
+			return srcRepo.LoadBlob(ctx, restic.DataBlob, blobID, buf)
 		}
 	}
+
+	// create saveBlob function
+	saveBlob := func(buf []byte) (id restic.ID, err error) {
+		id, _, _, err = dstRepo.SaveBlob(ctx, restic.DataBlob, buf, restic.ID{}, false)
+		return
+	}
+
+	wg, wgCtx := errgroup.WithContext(ctx)
 
 	debug.Log("Running job dispatcher")
 	// if the blob cache is enabled, both chRegular and chPriority are used.
 	// if the blob cache is disabled, only chRegular is used.
-	chRegular, chPriority := startDispatcher(wgBgCtx, wgBg, rc.filesList, rc.cache, rc.priorityFilesHandler)
+	chRegular, chPriority := startDispatcher(wgCtx, wg, rc.filesList, rc.cache, rc.priorityFilesHandler)
+
+	// create blob load callback (for fast blob eviction from cache)
+	onBlobLoad := createBlobLoadCallback(ctx, rc.cache, rc.idx)
 
 	// run workers
 	debug.Log("Running rechunk workers")
-	onBlobLoad := createBlobLoadCallback(ctx, rc.cache, rc.idx)
 	if rc.cache != nil {
-		rc.runWorkers(wgFgCtx, wgFg, numWorkers, getBlob, dstRepo, chPriority, chRegular, onBlobLoad, p)
-		rc.runWorkers(wgFgCtx, wgFg, 1, getBlob, dstRepo, chPriority, nil, onBlobLoad, p) // a dedicated worker that only processes priority files
+		rc.runWorkers(wgCtx, wg, numWorkers, getBlob, saveBlob, onBlobLoad, chPriority, chRegular, p)
+		rc.runWorkers(wgCtx, wg, 1, getBlob, saveBlob, onBlobLoad, chPriority, nil, p) // a dedicated worker that only processes priority files
 	} else {
-		rc.runWorkers(wgFgCtx, wgFg, numWorkers, getBlob, dstRepo, chRegular, nil, onBlobLoad, p)
+		rc.runWorkers(wgCtx, wg, numWorkers, getBlob, saveBlob, onBlobLoad, chRegular, nil, p)
 	}
 
 	// wait for foreground workers to finish
-	err := wgFg.Wait()
+	err := wg.Wait()
 	if err != nil {
 		return err
 	}
-	debug.Log("All rechunk workers finished.")
+	debug.Log("All rechunk jobs done.")
 
-	// finish background workers
+	// cleanup cache
 	rc.cache.Close()
-	err = wgBg.Wait()
-	if err != nil {
-		return err
-	}
-	debug.Log("All background workers finished.")
 
 	// debugNote: print report
 	if rc.cache != nil {
@@ -370,12 +364,14 @@ func createIndex(filesList []*ChunkedFile, lookupBlobFn func(t restic.BlobType, 
 	return idx, nil
 }
 
-func startCache(ctx context.Context, wg *errgroup.Group, srcRepo restic.Repository, idx *RechunkerIndex, numDownloaders int, cacheSize int) (*BlobCache, *PriorityFilesHandler) {
+func startCache(ctx context.Context, srcRepo restic.Repository, idx *RechunkerIndex, numDownloaders int, cacheSize int) (*BlobCache, *PriorityFilesHandler) {
 	debug.Log("Initiating priorityFilesHandler")
 	priorityFilesHandler := NewPriorityFilesHandler()
 
+	wg, wgCtx := errgroup.WithContext(ctx)
+
 	debug.Log("initiating cache")
-	cache := NewBlobCache(ctx, wg, cacheSize, numDownloaders, idx.blobToPack, idx.packToBlobs, srcRepo,
+	cache := NewBlobCache(wgCtx, wg, cacheSize, numDownloaders, idx.blobToPack, idx.packToBlobs, srcRepo,
 		func(blobIDs restic.IDs) {
 			// onReady() implementation
 			// when a new blob is ready, (small) files containing that blob has
@@ -428,6 +424,48 @@ func startCache(ctx context.Context, wg *errgroup.Group, srcRepo restic.Reposito
 	)
 
 	return cache, priorityFilesHandler
+}
+
+func startDispatcher(ctx context.Context, wg *errgroup.Group, filesList []*ChunkedFile, cache *BlobCache, priorityFilesHandler *PriorityFilesHandler) (chRegular, chPriority <-chan *ChunkedFile) {
+	if cache != nil {
+		// if cache is enabled
+
+		// visited files set shared among dispatchers
+		visitedFiles := restic.IDSet{}
+		visitedFilesLock := sync.Mutex{}
+
+		// goroutine for priority track (chPriority)
+		debug.Log("Running dispatcher for priority channel")
+		chPriority = createPriorityDispatchChannel(ctx, wg, priorityFilesHandler, func(id restic.ID) bool {
+			visitedFilesLock.Lock()
+			visited := visitedFiles.Has(id)
+			if !visited {
+				visitedFiles.Insert(id)
+			}
+			visitedFilesLock.Unlock()
+			return visited
+		})
+
+		// goroutine for regular track (chRegular)
+		debug.Log("Running dispatcher for regular channel")
+		chRegular = createFilesListDispatchChannel(ctx, wg, filesList, func(id restic.ID) bool {
+			visitedFilesLock.Lock()
+			visited := visitedFiles.Has(id)
+			if !visited {
+				visitedFiles.Insert(id)
+			}
+			visitedFilesLock.Unlock()
+			return visited
+		}, func() {
+			priorityFilesHandler.Close()
+		})
+	} else {
+		// if cache is disabled: use regular track only
+
+		chRegular = createFilesListDispatchChannel(ctx, wg, filesList, nil, nil)
+	}
+
+	return chRegular, chPriority
 }
 
 func createFilesListDispatchChannel(ctx context.Context, wg *errgroup.Group, filesList []*ChunkedFile, visited func(id restic.ID) bool, onFinishCB func()) <-chan *ChunkedFile {
@@ -499,49 +537,7 @@ func createPriorityDispatchChannel(ctx context.Context, wg *errgroup.Group, h *P
 	return ch
 }
 
-func startDispatcher(ctx context.Context, wg *errgroup.Group, filesList []*ChunkedFile, cache *BlobCache, priorityFilesHandler *PriorityFilesHandler) (chRegular, chPriority <-chan *ChunkedFile) {
-	if cache != nil {
-		// if cache is enabled
-
-		// visited files set shared among dispatchers
-		visitedFiles := restic.IDSet{}
-		visitedFilesLock := sync.Mutex{}
-
-		// goroutine for priority track (chPriority)
-		debug.Log("Running dispatcher for priority channel")
-		chPriority = createPriorityDispatchChannel(ctx, wg, priorityFilesHandler, func(id restic.ID) bool {
-			visitedFilesLock.Lock()
-			visited := visitedFiles.Has(id)
-			if !visited {
-				visitedFiles.Insert(id)
-			}
-			visitedFilesLock.Unlock()
-			return visited
-		})
-
-		// goroutine for regular track (chRegular)
-		debug.Log("Running dispatcher for regular channel")
-		chRegular = createFilesListDispatchChannel(ctx, wg, filesList, func(id restic.ID) bool {
-			visitedFilesLock.Lock()
-			visited := visitedFiles.Has(id)
-			if !visited {
-				visitedFiles.Insert(id)
-			}
-			visitedFilesLock.Unlock()
-			return visited
-		}, func() {
-			priorityFilesHandler.Close()
-		})
-	} else {
-		// if cache is disabled: use regular track only
-
-		chRegular = createFilesListDispatchChannel(ctx, wg, filesList, nil, nil)
-	}
-
-	return chRegular, chPriority
-}
-
-func (rc *Rechunker) runWorkers(ctx context.Context, wg *errgroup.Group, numWorkers int, getBlob getBlobFn, dstRepo restic.BlobSaver, chFirst <-chan *ChunkedFile, chSecond <-chan *ChunkedFile, onBlobLoad blobLoadCallbackFn, p *progress.Counter) {
+func (rc *Rechunker) runWorkers(ctx context.Context, wg *errgroup.Group, numWorkers int, getBlob getBlobFn, saveBlob saveBlobFn, onBlobLoad blobLoadCallbackFn, chFirst <-chan *ChunkedFile, chSecond <-chan *ChunkedFile, p *progress.Counter) {
 	if chFirst == nil { // assertion
 		panic("chFirst must not be nil")
 	}
@@ -550,7 +546,15 @@ func (rc *Rechunker) runWorkers(ctx context.Context, wg *errgroup.Group, numWork
 
 	for range numWorkers {
 		wg.Go(func() error {
-			chnker := chunker.New(nil, rc.pol)
+			workerState := &rechunkWorkerState{
+				chunkDict:  rc.chunkDict,
+				idx:        rc.idx,
+				chunker:    chunker.New(nil, rc.pol),
+				pol:        rc.pol,
+				getBlob:    getBlob,
+				saveBlob:   saveBlob,
+				onBlobLoad: onBlobLoad,
+			}
 
 			for {
 				// prioritize chFirst over chSecond
@@ -563,37 +567,16 @@ func (rc *Rechunker) runWorkers(ctx context.Context, wg *errgroup.Group, numWork
 				}
 
 				srcBlobs := file.IDs
-				dstBlobs := restic.IDs{}
-
-				// channels for pipeline
-				chStreamer := make(chan fileStreamReader)
-				chChunk := make(chan chunk)
-				chFastForward := make(chan fastForward, 1)
-				chDstBlobs := make(chan restic.IDs, 1)
+				chDstBlobs := make(chan restic.IDs, 2)
 
 				wgIn, ctxIn := errgroup.WithContext(ctx)
 
 				// data preparation for ChunkDict
 				useChunkDict := len(srcBlobs) != 0 && len(srcBlobs) >= LARGE_FILE_THRESHOLD
 				if useChunkDict {
-					// prepare chunkDict context, and check for prefix match
-					info, ff, prefix := prepareChunkDict(ctxIn, wgIn, srcBlobs, rc.chunkDict, rc.idx)
-					if ff != nil {
-						dstBlobs = prefix
-						chFastForward <- *ff
-					}
-
-					// start pipeline
-					startFileStreamerWithFastForward(ctxIn, wgIn, srcBlobs, chStreamer, getBlob, onBlobLoad, bufferPool, chFastForward)
-					startChunker(ctxIn, wgIn, chnker, rc.pol, chStreamer, chChunk, bufferPool)
-					startFileBlobSaverWithFastForward(ctxIn, wgIn, chChunk, chDstBlobs, dstRepo, bufferPool, chFastForward, info)
+					startPipelineWithChunkDict(ctxIn, wgIn, workerState, srcBlobs, chDstBlobs, bufferPool)
 				} else {
-					// not using chunkDict; simply stream-process from head to EOF
-
-					// start pipeline
-					startFileStreamer(ctxIn, wgIn, srcBlobs, chStreamer, getBlob, onBlobLoad, bufferPool)
-					startChunker(ctxIn, wgIn, chnker, rc.pol, chStreamer, chChunk, bufferPool)
-					startFileBlobSaver(ctxIn, wgIn, chChunk, chDstBlobs, dstRepo, bufferPool)
+					startPipeline(ctxIn, wgIn, workerState, srcBlobs, chDstBlobs, bufferPool)
 				}
 
 				err = wgIn.Wait()
@@ -601,7 +584,10 @@ func (rc *Rechunker) runWorkers(ctx context.Context, wg *errgroup.Group, numWork
 					return err
 				}
 
-				dstBlobs = append(dstBlobs, <-chDstBlobs...)
+				dstBlobs := restic.IDs{}
+				for blobs := range chDstBlobs {
+					dstBlobs = append(dstBlobs, blobs...)
+				}
 
 				// register to rechunkMap
 				hashval := HashOfIDs(srcBlobs)

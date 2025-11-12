@@ -310,6 +310,22 @@ func (c *BlobCache) Close() {
 	}
 }
 
+func createGetBlobFn(ctx context.Context, c *BlobCache) getBlobFn {
+	wg, wgCtx := errgroup.WithContext(ctx)
+
+	return func(blobID restic.ID, buf []byte, prefetch restic.IDs) ([]byte, error) {
+		blob, ch := c.Get(wgCtx, wg, blobID, buf, prefetch)
+		if blob == nil { // wait for blob to be downloaded
+			select {
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			case blob = <-ch:
+			}
+		}
+		return blob, nil
+	}
+}
+
 // PriorityFilesHandler is a wrapper for priority files (which are readily available in the blob cache).
 type PriorityFilesHandler struct {
 	filesList []*ChunkedFile

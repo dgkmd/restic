@@ -30,6 +30,16 @@ type fastForward struct {
 }
 type blobLoadCallbackFn func(ids restic.IDs) error
 
+type rechunkWorkerState struct {
+	chunkDict  *ChunkDict
+	idx        *RechunkerIndex
+	chunker    *chunker.Chunker
+	pol        chunker.Pol
+	getBlob    getBlobFn
+	saveBlob   saveBlobFn
+	onBlobLoad blobLoadCallbackFn
+}
+
 var ErrNewStream = errors.New("new stream")
 
 func createBlobLoadCallback(ctx context.Context, c *BlobCache, idx *RechunkerIndex) blobLoadCallbackFn {
@@ -141,6 +151,31 @@ func prepareChunkDict(ctx context.Context, wg *errgroup.Group, srcBlobs restic.I
 	}
 
 	return info, ff, prefix
+}
+
+func startPipeline(ctx context.Context, wg *errgroup.Group, s *rechunkWorkerState, srcBlobs restic.IDs, out chan<- restic.IDs, bufferPool chan []byte) {
+	chStreamer := make(chan fileStreamReader)
+	chChunk := make(chan chunk)
+
+	startFileStreamer(ctx, wg, srcBlobs, chStreamer, s.getBlob, s.onBlobLoad, bufferPool)
+	startChunker(ctx, wg, s.chunker, s.pol, chStreamer, chChunk, bufferPool)
+	startFileBlobSaver(ctx, wg, chChunk, out, s.saveBlob, bufferPool)
+}
+
+func startPipelineWithChunkDict(ctx context.Context, wg *errgroup.Group, s *rechunkWorkerState, srcBlobs restic.IDs, out chan<- restic.IDs, bufferPool chan []byte) {
+	chStreamer := make(chan fileStreamReader)
+	chChunk := make(chan chunk)
+	chFastForward := make(chan fastForward, 1)
+
+	info, ff, prefix := prepareChunkDict(ctx, wg, srcBlobs, s.chunkDict, s.idx)
+	if ff != nil {
+		out <- prefix
+		chFastForward <- *ff
+	}
+
+	startFileStreamerWithFastForward(ctx, wg, srcBlobs, chStreamer, s.getBlob, s.onBlobLoad, bufferPool, chFastForward)
+	startChunker(ctx, wg, s.chunker, s.pol, chStreamer, chChunk, bufferPool)
+	startFileBlobSaverWithFastForward(ctx, wg, chChunk, out, s.saveBlob, bufferPool, chFastForward, info)
 }
 
 func startFileStreamer(ctx context.Context, wg *errgroup.Group, srcBlobs restic.IDs, out chan<- fileStreamReader, getBlob getBlobFn, onBlobLoad blobLoadCallbackFn, bufferPool chan []byte) {
@@ -392,7 +427,7 @@ func startChunker(ctx context.Context, wg *errgroup.Group, chnker *chunker.Chunk
 	})
 }
 
-func startFileBlobSaver(ctx context.Context, wg *errgroup.Group, in <-chan chunk, out chan<- restic.IDs, dstRepo restic.BlobSaver, bufferPool chan<- []byte) {
+func startFileBlobSaver(ctx context.Context, wg *errgroup.Group, in <-chan chunk, out chan<- restic.IDs, saveBlob saveBlobFn, bufferPool chan<- []byte) {
 	wg.Go(func() error {
 		dstBlobs := restic.IDs{}
 		for {
@@ -405,13 +440,14 @@ func startFileBlobSaver(ctx context.Context, wg *errgroup.Group, in <-chan chunk
 			case c, ok = <-in:
 				if !ok { // EOF
 					out <- dstBlobs
+					close(out)
 					return nil
 				}
 			}
 
 			// save chunk to destination repo
 			buf := c.Data
-			dstBlobID, _, _, err := dstRepo.SaveBlob(ctx, restic.DataBlob, buf, restic.ID{}, false)
+			dstBlobID, err := saveBlob(c.Data)
 			if err != nil {
 				return err
 			}
@@ -426,7 +462,7 @@ func startFileBlobSaver(ctx context.Context, wg *errgroup.Group, in <-chan chunk
 	})
 }
 
-func startFileBlobSaverWithFastForward(ctx context.Context, wg *errgroup.Group, in <-chan chunk, out chan<- restic.IDs, dstRepo restic.BlobSaver, bufferPool chan<- []byte, ff chan<- fastForward, info *ChunkedFileContext) {
+func startFileBlobSaverWithFastForward(ctx context.Context, wg *errgroup.Group, in <-chan chunk, out chan<- restic.IDs, saveBlob saveBlobFn, bufferPool chan<- []byte, ff chan<- fastForward, info *ChunkedFileContext) {
 	wg.Go(func() error {
 		var stNum int
 		srcBlobs := info.srcBlobs
@@ -448,6 +484,7 @@ func startFileBlobSaverWithFastForward(ctx context.Context, wg *errgroup.Group, 
 			case c, ok = <-in:
 				if !ok { // EOF
 					out <- dstBlobs
+					close(out)
 					return nil
 				}
 			}
@@ -464,7 +501,7 @@ func startFileBlobSaverWithFastForward(ctx context.Context, wg *errgroup.Group, 
 
 			// save chunk to destination repo
 			buf := c.Data
-			dstBlobID, _, _, err := dstRepo.SaveBlob(ctx, restic.DataBlob, buf, restic.ID{}, false)
+			dstBlobID, err := saveBlob(c.Data)
 			if err != nil {
 				return err
 			}
