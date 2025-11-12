@@ -394,7 +394,9 @@ func startCache(ctx context.Context, srcRepo RechunkSrcRepo, idx *Index, numDown
 			}
 			idx.sfBlobRequiresLock.Unlock()
 
-			_ = priorityFilesHandler.Push(readyFiles)
+			if len(readyFiles) > 0 {
+				_ = priorityFilesHandler.Push(readyFiles)
+			}
 
 			// debugNote: trace blob load count
 			debugNoteLock.Lock()
