@@ -47,14 +47,14 @@ type Rechunker struct {
 	filesList    []*ChunkedFile
 	rechunkReady bool
 
-	idx *RechunkerIndex
+	idx *Index
 
 	rechunkMap     map[restic.ID]restic.IDs // hashOfIDs of srcBlobIDs -> dstBlobIDs
 	rechunkMapLock sync.Mutex
 	rewriteTreeMap map[restic.ID]restic.ID // original tree ID (in src repo) -> rewritten tree ID (in dst repo)
 }
 
-type RechunkerIndex struct {
+type Index struct {
 	// static data: once computed in Plan()
 	blobSize      map[restic.ID]uint
 	blobToPack    map[restic.ID]restic.ID      // blob ID -> {blob length, pack ID}
@@ -300,7 +300,7 @@ func gatherFileContents(ctx context.Context, repo restic.Repository, rootTrees r
 	return filesList, nil
 }
 
-func createIndex(filesList []*ChunkedFile, lookupBlob func(t restic.BlobType, id restic.ID) []restic.PackedBlob, useBlobCache bool) (idx *RechunkerIndex, err error) {
+func createIndex(filesList []*ChunkedFile, lookupBlob func(t restic.BlobType, id restic.ID) []restic.PackedBlob, useBlobCache bool) (idx *Index, err error) {
 	// collect blob usage info
 	blobRemaining := map[restic.ID]int{}
 	for _, file := range filesList {
@@ -328,7 +328,7 @@ func createIndex(filesList []*ChunkedFile, lookupBlob func(t restic.BlobType, id
 		packToBlobs[pb.PackID] = append(packToBlobs[pb.PackID], pb.Blob)
 	}
 
-	idx = &RechunkerIndex{
+	idx = &Index{
 		blobSize:      blobSize,
 		blobToPack:    blobToPack,
 		packToBlobs:   packToBlobs,
@@ -363,7 +363,7 @@ func createIndex(filesList []*ChunkedFile, lookupBlob func(t restic.BlobType, id
 	return idx, nil
 }
 
-func startCache(ctx context.Context, srcRepo RechunkSrcRepo, idx *RechunkerIndex, numDownloaders int, cacheSize int) (*BlobCache, *PriorityFilesHandler) {
+func startCache(ctx context.Context, srcRepo RechunkSrcRepo, idx *Index, numDownloaders int, cacheSize int) (*BlobCache, *PriorityFilesHandler) {
 	debug.Log("Initiating priorityFilesHandler")
 	priorityFilesHandler := NewPriorityFilesHandler()
 

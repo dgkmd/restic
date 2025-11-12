@@ -32,7 +32,7 @@ type blobLoadCallbackFn func(ids restic.IDs) error
 
 type rechunkWorkerState struct {
 	chunkDict  *ChunkDict
-	idx        *RechunkerIndex
+	idx        *Index
 	chunker    *chunker.Chunker
 	pol        chunker.Pol
 	getBlob    getBlobFn
@@ -42,7 +42,7 @@ type rechunkWorkerState struct {
 
 var ErrNewStream = errors.New("new stream")
 
-func createBlobLoadCallback(ctx context.Context, c *BlobCache, idx *RechunkerIndex) blobLoadCallbackFn {
+func createBlobLoadCallback(ctx context.Context, c *BlobCache, idx *Index) blobLoadCallbackFn {
 	if c == nil {
 		return nil
 	}
@@ -92,7 +92,7 @@ func prioritySelect(ctx context.Context, chFirst <-chan *ChunkedFile, chSecond <
 	return file, ok, nil
 }
 
-func prepareChunkDict(ctx context.Context, wg *errgroup.Group, srcBlobs restic.IDs, d *ChunkDict, idx *RechunkerIndex) (info *ChunkedFileContext, ff *fastForward, prefix restic.IDs) {
+func prepareChunkDict(srcBlobs restic.IDs, d *ChunkDict, idx *Index) (info *ChunkedFileContext, ff *fastForward, prefix restic.IDs) {
 	// build blobPos (position of each blob in a file)
 	blobPos := make([]uint, len(srcBlobs)+1)
 	var offset uint
@@ -167,7 +167,7 @@ func startPipelineWithChunkDict(ctx context.Context, wg *errgroup.Group, s *rech
 	chChunk := make(chan chunk)
 	chFastForward := make(chan fastForward, 1)
 
-	info, ff, prefix := prepareChunkDict(ctx, wg, srcBlobs, s.chunkDict, s.idx)
+	info, ff, prefix := prepareChunkDict(srcBlobs, s.chunkDict, s.idx)
 	if ff != nil {
 		out <- prefix
 		chFastForward <- *ff
@@ -198,7 +198,9 @@ func startFileStreamer(ctx context.Context, wg *errgroup.Group, srcBlobs restic.
 				return err
 			}
 			if onBlobLoad != nil {
-				onBlobLoad(srcBlobs[i : i+1])
+				if err := onBlobLoad(srcBlobs[i : i+1]); err != nil {
+					return err
+				}
 			}
 
 			// send the chunk to iopipe
@@ -270,7 +272,9 @@ func startFileStreamerWithFastForward(ctx context.Context, wg *errgroup.Group, s
 			select {
 			case ffPos := <-ff:
 				if onBlobLoad != nil {
-					onBlobLoad(srcBlobs[i:ffPos.blobIdx])
+					if err := onBlobLoad(srcBlobs[i:ffPos.blobIdx]); err != nil {
+						return err
+					}
 				}
 				stNum = ffPos.newStNum
 				i = ffPos.blobIdx
@@ -300,7 +304,9 @@ func startFileStreamerWithFastForward(ctx context.Context, wg *errgroup.Group, s
 				offset = 0
 			}
 			if onBlobLoad != nil {
-				onBlobLoad(srcBlobs[i : i+1])
+				if err := onBlobLoad(srcBlobs[i : i+1]); err != nil {
+					return err
+				}
 			}
 
 			// send the chunk to iopipe
