@@ -28,6 +28,10 @@ type fastForward struct {
 	blobIdx  int
 	offset   uint
 }
+type fileResult struct {
+	dstBlobs          restic.IDs
+	addedToRepository uint64
+}
 type blobLoadCallbackFn func(ids restic.IDs) error
 
 type rechunkWorkerState struct {
@@ -153,29 +157,29 @@ func prepareChunkDict(srcBlobs restic.IDs, d *ChunkDict, idx *Index) (info *Chun
 	return info, ff, prefix
 }
 
-func startPipeline(ctx context.Context, wg *errgroup.Group, s *rechunkWorkerState, srcBlobs restic.IDs, out chan<- restic.IDs, bufferPool chan []byte) {
+func startWorkerPipeline(ctx context.Context, wg *errgroup.Group, s *rechunkWorkerState, srcBlobs restic.IDs, out chan<- fileResult, bufferPool chan []byte, p *Progress) {
 	chStreamer := make(chan fileStreamReader)
 	chChunk := make(chan chunk)
 
 	startFileStreamer(ctx, wg, srcBlobs, chStreamer, s.getBlob, s.onBlobLoad, bufferPool)
 	startChunker(ctx, wg, s.chunker, s.pol, chStreamer, chChunk, bufferPool)
-	startFileBlobSaver(ctx, wg, chChunk, out, s.saveBlob, bufferPool)
+	startFileBlobSaver(ctx, wg, chChunk, out, s.saveBlob, bufferPool, p)
 }
 
-func startPipelineWithChunkDict(ctx context.Context, wg *errgroup.Group, s *rechunkWorkerState, srcBlobs restic.IDs, out chan<- restic.IDs, bufferPool chan []byte) {
+func startWorkerPipelineWithChunkDict(ctx context.Context, wg *errgroup.Group, s *rechunkWorkerState, srcBlobs restic.IDs, out chan<- fileResult, bufferPool chan []byte, p *Progress) {
 	chStreamer := make(chan fileStreamReader)
 	chChunk := make(chan chunk)
 	chFastForward := make(chan fastForward, 1)
 
 	info, ff, prefix := prepareChunkDict(srcBlobs, s.chunkDict, s.idx)
 	if ff != nil {
-		out <- prefix
+		out <- fileResult{prefix, 0}
 		chFastForward <- *ff
 	}
 
 	startFileStreamerWithFastForward(ctx, wg, srcBlobs, chStreamer, s.getBlob, s.onBlobLoad, bufferPool, chFastForward)
 	startChunker(ctx, wg, s.chunker, s.pol, chStreamer, chChunk, bufferPool)
-	startFileBlobSaverWithFastForward(ctx, wg, chChunk, out, s.saveBlob, bufferPool, chFastForward, info)
+	startFileBlobSaverWithFastForward(ctx, wg, chChunk, out, s.saveBlob, bufferPool, chFastForward, info, p)
 }
 
 func startFileStreamer(ctx context.Context, wg *errgroup.Group, srcBlobs restic.IDs, out chan<- fileStreamReader, getBlob getBlobFn, onBlobLoad blobLoadCallbackFn, bufferPool chan []byte) {
@@ -433,9 +437,10 @@ func startChunker(ctx context.Context, wg *errgroup.Group, chnker *chunker.Chunk
 	})
 }
 
-func startFileBlobSaver(ctx context.Context, wg *errgroup.Group, in <-chan chunk, out chan<- restic.IDs, saveBlob saveBlobFn, bufferPool chan<- []byte) {
+func startFileBlobSaver(ctx context.Context, wg *errgroup.Group, in <-chan chunk, out chan<- fileResult, saveBlob saveBlobFn, bufferPool chan<- []byte, p *Progress) {
 	wg.Go(func() error {
 		dstBlobs := restic.IDs{}
+		var addedSize uint64
 		for {
 			// receive chunk from chunker
 			var c chunk
@@ -445,7 +450,7 @@ func startFileBlobSaver(ctx context.Context, wg *errgroup.Group, in <-chan chunk
 				return ctx.Err()
 			case c, ok = <-in:
 				if !ok { // EOF
-					out <- dstBlobs
+					out <- fileResult{dstBlobs, addedSize}
 					close(out)
 					return nil
 				}
@@ -453,9 +458,16 @@ func startFileBlobSaver(ctx context.Context, wg *errgroup.Group, in <-chan chunk
 
 			// save chunk to destination repo
 			buf := c.Data
-			dstBlobID, err := saveBlob(c.Data)
+			dstBlobID, known, size, err := saveBlob(ctx, restic.DataBlob, buf, restic.ID{}, false)
 			if err != nil {
 				return err
+			}
+			if !known {
+				addedSize += uint64(size)
+			}
+
+			if p != nil {
+				p.AddBlob(uint64(c.Length))
 			}
 
 			// recycle used buffer into bufferPool
@@ -468,7 +480,7 @@ func startFileBlobSaver(ctx context.Context, wg *errgroup.Group, in <-chan chunk
 	})
 }
 
-func startFileBlobSaverWithFastForward(ctx context.Context, wg *errgroup.Group, in <-chan chunk, out chan<- restic.IDs, saveBlob saveBlobFn, bufferPool chan<- []byte, ff chan<- fastForward, info *ChunkedFileContext) {
+func startFileBlobSaverWithFastForward(ctx context.Context, wg *errgroup.Group, in <-chan chunk, out chan<- fileResult, saveBlob saveBlobFn, bufferPool chan<- []byte, ff chan<- fastForward, info *ChunkedFileContext, p *Progress) {
 	wg.Go(func() error {
 		var stNum int
 		srcBlobs := info.srcBlobs
@@ -479,6 +491,7 @@ func startFileBlobSaverWithFastForward(ctx context.Context, wg *errgroup.Group, 
 		currIdx := info.prefixIdx
 		currPos := info.prefixPos
 		dstBlobs := restic.IDs{}
+		var addedSize uint64
 
 		for {
 			// receive chunk from chunker
@@ -489,7 +502,7 @@ func startFileBlobSaverWithFastForward(ctx context.Context, wg *errgroup.Group, 
 				return ctx.Err()
 			case c, ok = <-in:
 				if !ok { // EOF
-					out <- dstBlobs
+					out <- fileResult{dstBlobs, addedSize}
 					close(out)
 					return nil
 				}
@@ -507,9 +520,16 @@ func startFileBlobSaverWithFastForward(ctx context.Context, wg *errgroup.Group, 
 
 			// save chunk to destination repo
 			buf := c.Data
-			dstBlobID, err := saveBlob(c.Data)
+			dstBlobID, known, size, err := saveBlob(ctx, restic.DataBlob, buf, restic.ID{}, false)
 			if err != nil {
 				return err
+			}
+			if !known {
+				addedSize += uint64(size)
+			}
+
+			if p != nil {
+				p.AddBlob(uint64(c.Length))
 			}
 
 			startOffset := currPos - blobPos[currIdx]
@@ -559,7 +579,9 @@ func startFileBlobSaverWithFastForward(ctx context.Context, wg *errgroup.Group, 
 
 				dstBlobs = append(dstBlobs, matchedDstBlobs...)
 
+				// compute new idx and pos
 				currIdx += numFinishedSrcBlobs
+				oldPos := currPos
 				currPos = blobPos[currIdx] + newOffset
 
 				stNum++
@@ -567,6 +589,10 @@ func startFileBlobSaverWithFastForward(ctx context.Context, wg *errgroup.Group, 
 					newStNum: stNum,
 					blobIdx:  currIdx,
 					offset:   newOffset,
+				}
+
+				if p != nil {
+					p.AddBlob(uint64(currPos - oldPos))
 				}
 			}
 		}

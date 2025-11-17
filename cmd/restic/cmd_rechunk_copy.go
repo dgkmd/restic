@@ -126,21 +126,26 @@ func runRechunkCopy(ctx context.Context, opts RechunkCopyOptions, gopts global.O
 	rechnker := rechunker.NewRechunker(dstRepo.Config().ChunkerPolynomial)
 	rootTrees := []restic.ID{}
 
-	// first pass: gather all root trees of snapshots for rechunking
+	// gather all root trees of snapshots for rechunking
 	debug.Log("Gathering root trees of target snapshots")
 	for sn := range FindFilteredSnapshots(ctx, srcSnapshotLister, srcRepo, &opts.SnapshotFilter, args, printer) {
 		rootTrees = append(rootTrees, *sn.Tree)
 	}
 
+	// run rechunk process
 	wg, wgCtx := errgroup.WithContext(ctx)
 	debug.Log("Starting pack uploader")
 	dstRepo.StartPackUploader(wgCtx, wg)
 	debug.Log("Running runRechunk()")
-	if err = runRechunk(ctx, srcRepo, rootTrees, dstRepo, rechnker, opts.CacheSize*(1<<20), printer); err != nil {
+	progress := rechunker.NewProgress(
+		term,
+		ui.CalculateProgressInterval(!gopts.Quiet, gopts.JSON, term.CanUpdateStatus()),
+	)
+	if err = runRechunk(ctx, srcRepo, rootTrees, dstRepo, rechnker, opts.CacheSize*(1<<20), printer, progress); err != nil {
 		return err
 	}
 
-	// second pass: rewrite trees
+	// rewrite trees
 	printer.V("Rewriting trees...\n")
 	for sn := range FindFilteredSnapshots(ctx, srcSnapshotLister, srcRepo, &opts.SnapshotFilter, args, printer) {
 		debug.Log("Running RewriteTree() for tree ID %v", sn.Tree.Str())
@@ -157,7 +162,7 @@ func runRechunkCopy(ctx context.Context, opts RechunkCopyOptions, gopts global.O
 
 	printer.V("Rewriting done.\n\n")
 
-	// third pass: write snapshots
+	// write snapshots
 	debug.Log("Writing snapshots")
 	for sn := range FindFilteredSnapshots(ctx, srcSnapshotLister, srcRepo, &opts.SnapshotFilter, args, printer) {
 		sn.Parent = nil // Parent does not have relevance in the new repo.
@@ -182,10 +187,17 @@ func runRechunkCopy(ctx context.Context, opts RechunkCopyOptions, gopts global.O
 		debug.Log("Snapshot %v (src repo) is rechunk-copied to snapshot %v (dst repo)", sn.ID().Str(), newID.Str())
 		printer.P("snapshot %s saved\n", newID.Str())
 	}
+
+	// summary
+	printer.P("\n[Post-run Summary]")
+	printer.P("Number of distinct files processed: %v", rechnker.NumFilesToProcess())
+	printer.P("  - Total size processed (including duplicate blobs): %v", ui.FormatBytes(rechnker.TotalSize()))
+	printer.P("Added to the repository: %v", ui.FormatBytes(rechnker.TotalAddedToDstRepo()))
+
 	return ctx.Err()
 }
 
-func runRechunk(ctx context.Context, srcRepo restic.Repository, roots []restic.ID, dstRepo restic.Repository, rechnker *rechunker.Rechunker, cacheSize int, printer progress.Printer) error {
+func runRechunk(ctx context.Context, srcRepo restic.Repository, roots []restic.ID, dstRepo restic.Repository, rechnker *rechunker.Rechunker, cacheSize int, printer progress.Printer, progress *rechunker.Progress) error {
 	printer.V("Preparing rechunking...\n")
 	debug.Log("Running Plan()")
 	err := rechnker.Plan(ctx, srcRepo, roots, cacheSize != 0)
@@ -193,14 +205,20 @@ func runRechunk(ctx context.Context, srcRepo restic.Repository, roots []restic.I
 		return err
 	}
 
-	bar := printer.NewCounter("distinct files rechunked")
-	bar.SetMax(uint64(rechnker.NumFilesToProcess()))
+	printer.P("\n[Pre-run Summary]")
+	// num_snapshots, num_distinct_files, total_size, num_packs,
+	printer.P("Number of snapshots: %v", len(roots))
+	printer.P("Number of distinct files to process: %v", rechnker.NumFilesToProcess())
+	printer.P("  - Total size (including duplicate blobs): %v", ui.FormatBytes(rechnker.TotalSize()))
+	printer.P("Number of packs to download: %v", rechnker.PackCount())
+
 	debug.Log("Running RechunkData()")
-	err = rechnker.RechunkData(ctx, srcRepo, dstRepo, cacheSize, bar)
+	progress.Start(rechnker.NumFilesToProcess(), rechnker.TotalSize())
+	err = rechnker.RechunkData(ctx, srcRepo, dstRepo, cacheSize, progress)
 	if err != nil {
 		return err
 	}
-	bar.Done()
+	progress.Done()
 
 	printer.V("Rechunking done.\n\n")
 
