@@ -19,6 +19,7 @@ type PackDownloadQueue struct {
 	wantedBlobs restic.IDSet
 	allWanted   bool
 }
+type downloadFn func(packID restic.ID, blobs []restic.Blob) (blobsMap BlobsMap, err error)
 
 type BlobCache struct {
 	mu sync.RWMutex
@@ -38,9 +39,9 @@ type BlobCache struct {
 	done chan struct{}
 }
 
-func NewBlobCache(ctx context.Context, wg *errgroup.Group, size int, numDownloaders int,
-	blobToPack map[restic.ID]restic.ID, packToBlobs map[restic.ID][]restic.Blob, repo RechunkSrcRepo, onReady func(blobIDs restic.IDs),
-	onEvict func(blobIDs restic.IDs)) *BlobCache {
+func NewBlobCache(ctx context.Context, size int, numDownloaders int,
+	blobToPack map[restic.ID]restic.ID, packToBlobs map[restic.ID][]restic.Blob, repo RechunkSrcRepo,
+	onReady func(blobIDs restic.IDs), onEvict func(blobIDs restic.IDs)) *BlobCache {
 	if size < 32*(1<<20) {
 		panic("Blob cache size should be at least 32 MiB!!")
 	}
@@ -65,7 +66,22 @@ func NewBlobCache(ctx context.Context, wg *errgroup.Group, size int, numDownload
 	}
 	c.c = lru
 
-	download := func(packID restic.ID, blobs []restic.Blob) (blobsMap BlobsMap, err error) {
+	// create download function that uses repo's LoadBlobsFromPack
+	download := createDownloadFn(ctx, repo)
+
+	wg, wgCtx := errgroup.WithContext(ctx)
+
+	// start blob downloaders
+	startBlobCacheDownloaders(wgCtx, wg, c, numDownloaders, download, onReady)
+
+	// start blob ignorer
+	startBlobCacheIgnorer(wgCtx, wg, c)
+
+	return c
+}
+
+func createDownloadFn(ctx context.Context, repo RechunkSrcRepo) downloadFn {
+	return func(packID restic.ID, blobs []restic.Blob) (blobsMap BlobsMap, err error) {
 		blobData := BlobsMap{}
 		err = repo.LoadBlobsFromPack(ctx, packID, blobs,
 			func(blob restic.BlobHandle, buf []byte, err error) error {
@@ -83,11 +99,13 @@ func NewBlobCache(ctx context.Context, wg *errgroup.Group, size int, numDownload
 		}
 		return blobData, nil
 	}
+}
 
-	// blob downloaders
+func startBlobCacheDownloaders(ctx context.Context, wg *errgroup.Group, c *BlobCache, numDownloaders int, download downloadFn, onReady func(blobIDs restic.IDs)) {
 	for range numDownloaders {
 		wg.Go(func() error {
 			for {
+				// listen to download request
 				var packID restic.ID
 				select {
 				case <-ctx.Done():
@@ -97,6 +115,7 @@ func NewBlobCache(ctx context.Context, wg *errgroup.Group, size int, numDownload
 				case packID = <-c.downloadCh:
 				}
 
+				// retrieve pack info from the queue, and filter unneeded blobs
 				c.mu.Lock()
 				q := c.q[packID]
 				delete(c.q, packID)
@@ -120,11 +139,13 @@ func NewBlobCache(ctx context.Context, wg *errgroup.Group, size int, numDownload
 					continue
 				}
 
+				// download blobs from the repo
 				blobsMap, err := download(packID, filteredBlobs)
 				if err != nil {
 					return err
 				}
 
+				// save downloaded blobs to the cache
 				var blobIDs restic.IDs
 				c.mu.Lock()
 				for id, data := range blobsMap {
@@ -141,6 +162,7 @@ func NewBlobCache(ctx context.Context, wg *errgroup.Group, size int, numDownload
 				debugCurrMemUsage := c.size - c.free
 				c.mu.Unlock()
 
+				// execute onReady callback
 				if onReady != nil {
 					onReady(blobIDs)
 				}
@@ -157,10 +179,12 @@ func NewBlobCache(ctx context.Context, wg *errgroup.Group, size int, numDownload
 			}
 		})
 	}
+}
 
-	// blob ignorer
+func startBlobCacheIgnorer(ctx context.Context, wg *errgroup.Group, c *BlobCache) {
 	wg.Go(func() error {
 		for {
+			// listen to ignore request (which is provided by c.Ignore())
 			var ids restic.IDs
 			select {
 			case <-ctx.Done():
@@ -170,6 +194,7 @@ func NewBlobCache(ctx context.Context, wg *errgroup.Group, size int, numDownload
 			case ids = <-c.evictCh:
 			}
 
+			// add the blobs to ignore list and evict from cache immediately
 			c.mu.Lock()
 			for _, id := range ids {
 				c.ignores.Insert(id)
@@ -185,8 +210,6 @@ func NewBlobCache(ctx context.Context, wg *errgroup.Group, size int, numDownload
 			debugNoteLock.Unlock()
 		}
 	})
-
-	return c
 }
 
 func (c *BlobCache) Get(ctx context.Context, wg *errgroup.Group, id restic.ID, buf []byte, prefetch restic.IDs) ([]byte, chan []byte) {
@@ -206,6 +229,12 @@ func (c *BlobCache) Get(ctx context.Context, wg *errgroup.Group, id restic.ID, b
 
 	// case 2: when blob does not exist in cache: return chOut (where downloaded blob will be delievered)
 	chOut := make(chan []byte, 1)
+	c.asyncGet(ctx, wg, id, buf, prefetch, chOut)
+
+	return nil, chOut
+}
+
+func (c *BlobCache) asyncGet(ctx context.Context, wg *errgroup.Group, id restic.ID, buf []byte, prefetch restic.IDs, out chan<- []byte) {
 	wg.Go(func() error {
 		for {
 			c.mu.RLock()
@@ -213,7 +242,7 @@ func (c *BlobCache) Get(ctx context.Context, wg *errgroup.Group, id restic.ID, b
 			finish, inProgress := c.inProgress[id]
 			c.mu.RUnlock()
 
-			if ready { // case 2A: blob is now ready in the cache
+			if ready { // case A: blob is now ready in the cache
 				if cap(buf) < len(blob) {
 					debug.Log("buffer has smaller capacity than chunk size. Something might be wrong!")
 					buf = make([]byte, len(blob))
@@ -221,10 +250,10 @@ func (c *BlobCache) Get(ctx context.Context, wg *errgroup.Group, id restic.ID, b
 					buf = buf[:len(blob)]
 				}
 				copy(buf, blob)
-				chOut <- buf
+				out <- buf
 				return nil
 			}
-			if inProgress { // case 2B: blob is being downloaded now
+			if inProgress { // case B: blob is being downloaded now
 				select {
 				case <-ctx.Done():
 					return ctx.Err()
@@ -233,61 +262,68 @@ func (c *BlobCache) Get(ctx context.Context, wg *errgroup.Group, id restic.ID, b
 				}
 			}
 
-			// case 2C: blob is neither in the cache nor being downloaded
-
-			// construct validBlobs set for prefetch
-			packID := c.blobToPack[id]
-			validBlobs := restic.NewIDSet(id)
-			var allWanted bool
-			if prefetch == nil {
-				allWanted = true
-			} else {
-				for _, b := range prefetch {
-					if pid := c.blobToPack[b]; packID == pid {
-						validBlobs.Insert(b)
-					}
-				}
-			}
-
-			c.mu.Lock()
-			q, ok := c.q[packID]
-			if ok { // case 2C-i: pack is in the queue: just add validBlobs to wanted list
-				if allWanted {
-					q.allWanted = true
-				} else {
-					q.wantedBlobs.Merge(validBlobs)
-				}
-			} else { // case 2C-ii: pack is not in the queue: create new one
-				q = PackDownloadQueue{
-					waiter:      make(chan struct{}),
-					wantedBlobs: validBlobs,
-					allWanted:   allWanted,
-				}
-				c.q[packID] = q
-			}
-			c.mu.Unlock()
-
-			if !ok { // if you are one who created the queue, send packID to inform the downloader
-				select {
-				case <-ctx.Done():
-					return ctx.Err()
-				case <-c.done:
-					return fmt.Errorf("cache closed")
-				case c.downloadCh <- packID:
-				}
-			}
-
-			// wait until it starts downloading
-			select {
-			case <-ctx.Done():
-				return ctx.Err()
-			case <-c.done:
-				return fmt.Errorf("cache closed")
-			case <-q.waiter:
+			// case C: blob is neither in the cache nor being downloaded
+			// add to the download queue
+			err := c.requestDownload(ctx, id, prefetch)
+			if err != nil {
+				return err
 			}
 		}
 	})
-	return nil, chOut
+}
+
+func (c *BlobCache) requestDownload(ctx context.Context, id restic.ID, prefetch restic.IDs) error {
+	// construct validBlobs set for prefetch
+	packID := c.blobToPack[id]
+	validBlobs := restic.NewIDSet(id)
+	var allWanted bool
+	if prefetch == nil {
+		allWanted = true
+	} else {
+		for _, b := range prefetch {
+			if pid := c.blobToPack[b]; packID == pid {
+				validBlobs.Insert(b)
+			}
+		}
+	}
+
+	c.mu.Lock()
+	q, ok := c.q[packID]
+	if ok { // case i: pack is in the queue: just add validBlobs to wanted list
+		if allWanted {
+			q.allWanted = true
+		} else {
+			q.wantedBlobs.Merge(validBlobs)
+		}
+	} else { // case ii: pack is not in the queue: create new one
+		q = PackDownloadQueue{
+			waiter:      make(chan struct{}),
+			wantedBlobs: validBlobs,
+			allWanted:   allWanted,
+		}
+		c.q[packID] = q
+	}
+	c.mu.Unlock()
+
+	if !ok { // if you are one who created the queue, send packID to inform the downloader
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-c.done:
+			return fmt.Errorf("cache closed")
+		case c.downloadCh <- packID:
+		}
+	}
+
+	// wait until it starts downloading
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-c.done:
+		return fmt.Errorf("cache closed")
+	case <-q.waiter:
+		return nil
+	}
 }
 
 func (c *BlobCache) Ignore(ctx context.Context, blobs restic.IDs) error {

@@ -25,11 +25,6 @@ const LARGE_FILE_THRESHOLD = 50
 var debugNote = map[string]int{}
 var debugNoteLock = sync.Mutex{}
 
-type PlanSummary struct {
-	NumPacks  int
-	TotalSize uint64
-}
-
 type getBlobFn func(blobID restic.ID, buf []byte, prefetch restic.IDs) ([]byte, error)
 type saveBlobFn func(context.Context, restic.BlobType, []byte, restic.ID, bool) (restic.ID, bool, int, error)
 
@@ -84,7 +79,6 @@ func NewRechunker(pol chunker.Pol) *Rechunker {
 	}
 }
 
-// TODO: compute stats info and return it (number of snapshots, number of packs, total size, ...)
 func (rc *Rechunker) Plan(ctx context.Context, srcRepo restic.Repository, rootTrees []restic.ID, useBlobCache bool) error {
 	rc.reset()
 
@@ -131,7 +125,7 @@ func (rc *Rechunker) RechunkData(ctx context.Context, srcRepo RechunkSrcRepo, ds
 	numWorkers := min(runtime.GOMAXPROCS(0), int(srcRepo.Connections()))
 	debug.Log("srcRepo.Connections(): %v", srcRepo.Connections())
 
-	// prepare blob cache and create getBlob function
+	// prepare in-memory blob cache and create getBlob function
 	var getBlob getBlobFn
 	if cacheSize > 0 {
 		debug.Log("Creating blob cache: cacheSize %v", cacheSize)
@@ -151,24 +145,29 @@ func (rc *Rechunker) RechunkData(ctx context.Context, srcRepo RechunkSrcRepo, ds
 
 	wg, wgCtx := errgroup.WithContext(ctx)
 
-	debug.Log("Running job dispatcher")
+	debug.Log("Running file dispatcher")
 	// if the blob cache is enabled, both chRegular and chPriority are used.
+	// chPriority is for files whose consisting blobs are all available in the blob cache.
+	// chRegular iterates rc.filesList.
 	// if the blob cache is disabled, only chRegular is used.
 	chRegular, chPriority := startDispatcher(wgCtx, wg, rc.filesList, rc.cache, rc.priorityFilesHandler)
 
-	// create blob load callback (for fast blob eviction from cache)
+	// create blob load callback (for fast blob eviction from cache when no longer necessary)
 	onBlobLoad := createBlobLoadCallback(ctx, rc.cache, rc.idx)
 
-	// run workers
+	// run rechunk workers
 	debug.Log("Running rechunk workers")
 	if rc.cache != nil {
 		rc.runWorkers(wgCtx, wg, numWorkers, getBlob, saveBlob, onBlobLoad, chPriority, chRegular, p)
-		rc.runWorkers(wgCtx, wg, 1, getBlob, saveBlob, onBlobLoad, chPriority, nil, p) // a dedicated worker that only processes priority files
+
+		// below is a dedicated worker that only processes priority files;
+		// it relieves pressure on chPriority even when all other workers are stuck processing (large) chRegular files
+		rc.runWorkers(wgCtx, wg, 1, getBlob, saveBlob, onBlobLoad, chPriority, nil, p)
 	} else {
 		rc.runWorkers(wgCtx, wg, numWorkers, getBlob, saveBlob, onBlobLoad, chRegular, nil, p)
 	}
 
-	// wait for foreground workers to finish
+	// wait for rechunk workers to finish
 	err := wg.Wait()
 	if err != nil {
 		return err
@@ -375,10 +374,8 @@ func startCache(ctx context.Context, srcRepo RechunkSrcRepo, idx *Index, numDown
 	debug.Log("Initiating priorityFilesHandler")
 	priorityFilesHandler := NewPriorityFilesHandler()
 
-	wg, wgCtx := errgroup.WithContext(ctx)
-
 	debug.Log("initiating cache")
-	cache := NewBlobCache(wgCtx, wg, cacheSize, numDownloaders, idx.blobToPack, idx.packToBlobs, srcRepo,
+	cache := NewBlobCache(ctx, cacheSize, numDownloaders, idx.blobToPack, idx.packToBlobs, srcRepo,
 		func(blobIDs restic.IDs) {
 			// onReady() implementation
 			// when a new blob is ready, (small) files containing that blob has
@@ -594,10 +591,10 @@ func (rc *Rechunker) runWorkers(ctx context.Context, wg *errgroup.Group, numWork
 				}
 
 				dstBlobs := restic.IDs{}
-				var addedSize uint64
+				var addedToRepo uint64
 				for result := range chResult {
 					dstBlobs = append(dstBlobs, result.dstBlobs...)
-					addedSize += result.addedToRepository
+					addedToRepo += result.addedToRepository
 				}
 
 				// register to rechunkMap
@@ -606,8 +603,8 @@ func (rc *Rechunker) runWorkers(ctx context.Context, wg *errgroup.Group, numWork
 				rc.rechunkMap[hashval] = dstBlobs
 				rc.rechunkMapLock.Unlock()
 
-				// update totalAdded
-				_ = rc.totalAddedToDstRepo.Add(addedSize)
+				// update totalAddedToDstRepo size
+				_ = rc.totalAddedToDstRepo.Add(addedToRepo)
 
 				if p != nil {
 					p.AddFile(1)
@@ -631,7 +628,7 @@ func (rc *Rechunker) rewriteNode(node *data.Node) error {
 	return nil
 }
 
-func (rc *Rechunker) NumFilesToProcess() int {
+func (rc *Rechunker) NumFiles() int {
 	return len(rc.filesList)
 }
 

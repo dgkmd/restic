@@ -190,7 +190,7 @@ func runRechunkCopy(ctx context.Context, opts RechunkCopyOptions, gopts global.O
 
 	// summary
 	printer.P("\n[Post-run Summary]")
-	printer.P("Number of distinct files processed: %v", rechnker.NumFilesToProcess())
+	printer.P("Number of distinct files processed: %v", rechnker.NumFiles())
 	printer.P("  - Total size processed (including duplicate blobs): %v", ui.FormatBytes(rechnker.TotalSize()))
 	printer.P("Added to the repository: %v", ui.FormatBytes(rechnker.TotalAddedToDstRepo()))
 
@@ -208,12 +208,12 @@ func runRechunk(ctx context.Context, srcRepo restic.Repository, roots []restic.I
 	printer.P("\n[Pre-run Summary]")
 	// num_snapshots, num_distinct_files, total_size, num_packs,
 	printer.P("Number of snapshots: %v", len(roots))
-	printer.P("Number of distinct files to process: %v", rechnker.NumFilesToProcess())
+	printer.P("Number of distinct files to process: %v", rechnker.NumFiles())
 	printer.P("  - Total size (including duplicate blobs): %v", ui.FormatBytes(rechnker.TotalSize()))
 	printer.P("Number of packs to download: %v", rechnker.PackCount())
 
 	debug.Log("Running RechunkData()")
-	progress.Start(rechnker.NumFilesToProcess(), rechnker.TotalSize())
+	progress.Start(rechnker.NumFiles(), rechnker.TotalSize())
 	err = rechnker.RechunkData(ctx, srcRepo, dstRepo, cacheSize, progress)
 	if err != nil {
 		return err
