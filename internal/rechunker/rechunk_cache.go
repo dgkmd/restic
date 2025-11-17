@@ -177,9 +177,7 @@ func NewBlobCache(ctx context.Context, wg *errgroup.Group, size int, numDownload
 			}
 			c.mu.Unlock()
 
-			for _, id := range ids {
-				debug.Log("Blob %v is ignored, no longer will be downloaded", id.Str())
-			}
+			debug.Log("Blobs %v are ignored, no longer will be downloaded", ids.String())
 
 			// debugNote: track the number of ignored blobs
 			debugNoteLock.Lock()

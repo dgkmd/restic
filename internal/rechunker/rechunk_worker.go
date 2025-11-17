@@ -77,12 +77,21 @@ func prioritySelect(ctx context.Context, chFirst <-chan *ChunkedFile, chSecond <
 		case <-ctx.Done():
 			return nil, false, ctx.Err()
 		case file, ok = <-chFirst:
+			if ok {
+				debug.Log("Selected file %v from chFirst (prioritized)", file.hashval.Str())
+			}
 		default:
 			select {
 			case <-ctx.Done():
 				return nil, false, ctx.Err()
 			case file, ok = <-chFirst:
+				if ok {
+					debug.Log("Selected file %v from chFirst", file.hashval.Str())
+				}
 			case file, ok = <-chSecond:
+				if ok {
+					debug.Log("Selected file %v from chSecond", file.hashval.Str())
+				}
 			}
 		}
 	} else {
@@ -90,6 +99,9 @@ func prioritySelect(ctx context.Context, chFirst <-chan *ChunkedFile, chSecond <
 		case <-ctx.Done():
 			return nil, false, ctx.Err()
 		case file, ok = <-chFirst:
+			if ok {
+				debug.Log("Selected file %v", file.hashval.Str())
+			}
 		}
 	}
 
@@ -193,6 +205,7 @@ func startFileStreamer(ctx context.Context, wg *errgroup.Group, srcBlobs restic.
 			select {
 			case buf = <-bufferPool:
 			default:
+				debug.Log("Allocating a new buffer")
 				buf = make([]byte, 0, chunker.MaxSize)
 			}
 
@@ -212,6 +225,7 @@ func startFileStreamer(ctx context.Context, wg *errgroup.Group, srcBlobs restic.
 			case <-ctx.Done():
 				return ctx.Err()
 			case ch <- buf:
+				debug.Log("Sent srcBlob %v to iopipe", srcBlobs[i].Str())
 			}
 		}
 		close(ch)
@@ -253,6 +267,7 @@ func startFileStreamer(ctx context.Context, wg *errgroup.Group, srcBlobs restic.
 			select {
 			case bufferPool <- buf:
 			default:
+				debug.Log("bufferPool full; buffer discarded")
 			}
 		}
 	})
@@ -275,6 +290,7 @@ func startFileStreamerWithFastForward(ctx context.Context, wg *errgroup.Group, s
 			// check if a fast-forward request has arrived
 			select {
 			case ffPos := <-ff:
+				debug.Log("Received FastForward; fast-forwarding %v blobs (stNum: %v)", ffPos.blobIdx-i, ffPos.newStNum)
 				if onBlobLoad != nil {
 					if err := onBlobLoad(srcBlobs[i:ffPos.blobIdx]); err != nil {
 						return err
@@ -294,6 +310,7 @@ func startFileStreamerWithFastForward(ctx context.Context, wg *errgroup.Group, s
 			select {
 			case buf = <-bufferPool:
 			default:
+				debug.Log("Allocating a new buffer")
 				buf = make([]byte, 0, chunker.MaxSize)
 			}
 
@@ -318,6 +335,7 @@ func startFileStreamerWithFastForward(ctx context.Context, wg *errgroup.Group, s
 			case <-ctx.Done():
 				return ctx.Err()
 			case ch <- blob{buf: buf, stNum: stNum}:
+				debug.Log("Sent srcBlob %v to iopipe", srcBlobs[i].Str())
 			}
 		}
 		close(ch)
@@ -351,6 +369,7 @@ func startFileStreamerWithFastForward(ctx context.Context, wg *errgroup.Group, s
 
 			// handle fast-forward
 			if b.stNum > stNum {
+				debug.Log("Found new stNum (%v->%v); creating new stream", stNum, b.stNum)
 				stNum = b.stNum
 				w.CloseWithError(ErrNewStream)
 				r, w = io.Pipe()
@@ -358,6 +377,7 @@ func startFileStreamerWithFastForward(ctx context.Context, wg *errgroup.Group, s
 				case <-ctx.Done():
 					return ctx.Err()
 				case out <- fileStreamReader{r, stNum}:
+					debug.Log("New file stream reader sent")
 				}
 			}
 
@@ -373,6 +393,7 @@ func startFileStreamerWithFastForward(ctx context.Context, wg *errgroup.Group, s
 			select {
 			case bufferPool <- buf:
 			default:
+				debug.Log("bufferPool full; buffer discarded")
 			}
 		}
 	})
@@ -432,6 +453,7 @@ func startChunker(ctx context.Context, wg *errgroup.Group, chnker *chunker.Chunk
 				r.CloseWithError(ctx.Err())
 				return ctx.Err()
 			case out <- chunk{c, r.stNum}:
+				debug.Log("Sending a new chunk of size %v to blob saver", c.Length)
 			}
 		}
 	})
@@ -465,6 +487,7 @@ func startFileBlobSaver(ctx context.Context, wg *errgroup.Group, in <-chan chunk
 			if !known {
 				addedSize += uint64(size)
 			}
+			debug.Log("Stored new dst chunk %v into dstRepo", dstBlobID.Str())
 
 			if p != nil {
 				p.AddBlob(uint64(c.Length))
@@ -474,6 +497,7 @@ func startFileBlobSaver(ctx context.Context, wg *errgroup.Group, in <-chan chunk
 			select {
 			case bufferPool <- buf:
 			default:
+				debug.Log("bufferPool full; buffer discarded")
 			}
 			dstBlobs = append(dstBlobs, dstBlobID)
 		}
@@ -511,9 +535,11 @@ func startFileBlobSaverWithFastForward(ctx context.Context, wg *errgroup.Group, 
 			if c.stNum < stNum {
 				// just arrived chunk had been skipped by chunkDict match,
 				// so just flush it away and receive next chunk
+				debug.Log("Chunk of obsolete stNum received; discarding.")
 				select {
 				case bufferPool <- c.Data:
 				default:
+					debug.Log("bufferPool full; buffer discarded")
 				}
 				continue
 			}
@@ -527,6 +553,7 @@ func startFileBlobSaverWithFastForward(ctx context.Context, wg *errgroup.Group, 
 			if !known {
 				addedSize += uint64(size)
 			}
+			debug.Log("Stored new dst chunk %v into dstRepo", dstBlobID.Str())
 
 			if p != nil {
 				p.AddBlob(uint64(c.Length))
@@ -564,6 +591,7 @@ func startFileBlobSaverWithFastForward(ctx context.Context, wg *errgroup.Group, 
 			select {
 			case bufferPool <- buf:
 			default:
+				debug.Log("bufferPool full; buffer discarded")
 			}
 			dstBlobs = append(dstBlobs, dstBlobID)
 
@@ -584,6 +612,7 @@ func startFileBlobSaverWithFastForward(ctx context.Context, wg *errgroup.Group, 
 				oldPos := currPos
 				currPos = blobPos[currIdx] + newOffset
 
+				debug.Log("Sending FastForward with new stNum (%v->%v)", stNum, stNum+1)
 				stNum++
 				ff <- fastForward{
 					newStNum: stNum,
