@@ -18,13 +18,15 @@ type Progress struct {
 	bytesProcessed uint64
 	bytesTotal     uint64
 
-	term ui.Terminal
-	show bool
+	printer progress.Printer
+	term    ui.Terminal
+	show    bool
 }
 
-func NewProgress(term ui.Terminal, interval time.Duration) *Progress {
+func NewProgress(term ui.Terminal, printer progress.Printer, interval time.Duration) *Progress {
 	p := &Progress{
-		term: term,
+		term:    term,
+		printer: printer,
 	}
 	p.updater = *progress.NewUpdater(interval, p.update)
 
@@ -66,9 +68,19 @@ func (p *Progress) update(duration time.Duration, final bool) {
 		progress := []string{
 			fmt.Sprintf("[%s] %v/%v distinct files processed",
 				formattedDuration, p.filesFinished, p.filesTotal),
-			fmt.Sprintf("%v %v/%v", percent, formattedBytesProcessed, formattedBytesTotal),
+			fmt.Sprintf("%s %s/%s", percent, formattedBytesProcessed, formattedBytesTotal),
 		}
 		p.term.SetStatus(progress)
+	} else if p.show && final {
+		formattedDuration := ui.FormatDuration(duration)
+		formattedBytesProcessed := ui.FormatBytes(p.bytesProcessed)
+		formattedBytesTotal := ui.FormatBytes(p.bytesTotal)
+		percent := ui.FormatPercent(p.bytesProcessed, p.bytesTotal)
+
+		p.term.SetStatus(nil)
+		p.printer.P("[%s] %v/%v distinct files processed\n", formattedDuration, p.filesFinished, p.filesTotal)
+		p.printer.P("%s %s/%s\n", percent, formattedBytesProcessed, formattedBytesTotal)
+		p.show = false
 	} else {
 		p.term.SetStatus(nil)
 	}

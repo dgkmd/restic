@@ -28,14 +28,14 @@ var debugNoteLock = sync.Mutex{}
 type getBlobFn func(blobID restic.ID, buf []byte, prefetch restic.IDs) ([]byte, error)
 type saveBlobFn func(context.Context, restic.BlobType, []byte, restic.ID, bool) (restic.ID, bool, int, error)
 
-type RechunkSrcRepo interface {
+type SrcRepo interface {
 	restic.BlobLoader
 	LoadBlobsFromPack(ctx context.Context, packID restic.ID, blobs []restic.Blob, handleBlobFn func(blob restic.BlobHandle, buf []byte, err error) error) error
 	Connections() uint
 }
 
-type RechunkDstRepo interface {
-	restic.BlobSaver
+type DstRepo interface {
+	restic.WithBlobUploader
 }
 
 type Rechunker struct {
@@ -116,7 +116,7 @@ func (rc *Rechunker) Plan(ctx context.Context, srcRepo restic.Repository, rootTr
 	return nil
 }
 
-func (rc *Rechunker) RechunkData(ctx context.Context, srcRepo RechunkSrcRepo, dstRepo RechunkDstRepo, cacheSize int, p *Progress) error {
+func (rc *Rechunker) RechunkData(ctx context.Context, srcRepo SrcRepo, dstRepo DstRepo, cacheSize int, p *Progress) error {
 	if !rc.rechunkReady {
 		return fmt.Errorf("Plan() must be run first before RechunkData()")
 	}
@@ -140,35 +140,46 @@ func (rc *Rechunker) RechunkData(ctx context.Context, srcRepo RechunkSrcRepo, ds
 		}
 	}
 
-	// define saveBlob function
-	saveBlob := dstRepo.SaveBlob
-
-	wg, wgCtx := errgroup.WithContext(ctx)
+	wg, ctx := errgroup.WithContext(ctx)
 
 	debug.Log("Running file dispatcher")
 	// if the blob cache is enabled, both chRegular and chPriority are used.
 	// chPriority is for files whose consisting blobs are all available in the blob cache.
 	// chRegular iterates rc.filesList.
 	// if the blob cache is disabled, only chRegular is used.
-	chRegular, chPriority := startDispatcher(wgCtx, wg, rc.filesList, rc.cache, rc.priorityFilesHandler)
+	chRegular, chPriority := startDispatcher(ctx, wg, rc.filesList, rc.cache, rc.priorityFilesHandler)
 
 	// create blob load callback (for fast blob eviction from cache when no longer necessary)
 	onBlobLoad := createBlobLoadCallback(ctx, rc.cache, rc.idx)
 
 	// run rechunk workers
 	debug.Log("Running rechunk workers")
-	if rc.cache != nil {
-		rc.runWorkers(wgCtx, wg, numWorkers, getBlob, saveBlob, onBlobLoad, chPriority, chRegular, p)
+	err := dstRepo.WithBlobUploader(ctx, func(ctx context.Context, uploader restic.BlobSaver) error {
+		debug.Log("Starting WithBlobUploader()")
+		defer debug.Log("Terminating WithBlobUploader()")
 
-		// below is a dedicated worker that only processes priority files;
-		// it relieves pressure on chPriority even when all other workers are stuck processing (large) chRegular files
-		rc.runWorkers(wgCtx, wg, 1, getBlob, saveBlob, onBlobLoad, chPriority, nil, p)
-	} else {
-		rc.runWorkers(wgCtx, wg, numWorkers, getBlob, saveBlob, onBlobLoad, chRegular, nil, p)
+		wg, ctx := errgroup.WithContext(ctx)
+
+		saveBlob := uploader.SaveBlob
+
+		if rc.cache != nil {
+			rc.runWorkers(ctx, wg, numWorkers, getBlob, saveBlob, onBlobLoad, chPriority, chRegular, p)
+
+			// below is a dedicated worker that only processes priority files;
+			// it relieves pressure on chPriority even when all other workers are stuck processing (large) chRegular files
+			rc.runWorkers(ctx, wg, 1, getBlob, saveBlob, onBlobLoad, chPriority, nil, p)
+		} else {
+			rc.runWorkers(ctx, wg, numWorkers, getBlob, saveBlob, onBlobLoad, chRegular, nil, p)
+		}
+
+		return wg.Wait()
+	})
+	if err != nil {
+		return err
 	}
 
 	// wait for rechunk workers to finish
-	err := wg.Wait()
+	err = wg.Wait()
 	if err != nil {
 		return err
 	}
@@ -255,10 +266,10 @@ func (rc *Rechunker) reset() {
 }
 
 func gatherFileContents(ctx context.Context, repo restic.Repository, rootTrees restic.IDs, visitedFiles restic.IDSet, visitedTrees restic.IDSet) (filesList []*ChunkedFile, totalSize uint64, err error) {
-	wg, wgCtx := errgroup.WithContext(ctx)
+	wg, ctx := errgroup.WithContext(ctx)
 
 	// create StreamTrees channel that streams through all subtrees in target snapshots
-	treeStream := data.StreamTrees(wgCtx, wg, repo, rootTrees, func(id restic.ID) bool {
+	treeStream := data.StreamTrees(ctx, wg, repo, rootTrees, func(id restic.ID) bool {
 		visited := visitedTrees.Has(id)
 		visitedTrees.Insert(id)
 		return visited
@@ -370,7 +381,7 @@ func createIndex(filesList []*ChunkedFile, lookupBlob func(t restic.BlobType, id
 	return idx, nil
 }
 
-func startCache(ctx context.Context, srcRepo RechunkSrcRepo, idx *Index, numDownloaders int, cacheSize int) (*BlobCache, *PriorityFilesHandler) {
+func startCache(ctx context.Context, srcRepo SrcRepo, idx *Index, numDownloaders int, cacheSize int) (*BlobCache, *PriorityFilesHandler) {
 	debug.Log("Initiating priorityFilesHandler")
 	priorityFilesHandler := NewPriorityFilesHandler()
 
@@ -575,17 +586,17 @@ func (rc *Rechunker) runWorkers(ctx context.Context, wg *errgroup.Group, numWork
 				srcBlobs := file.IDs
 				chResult := make(chan fileResult, 2)
 
-				wgIn, ctxIn := errgroup.WithContext(ctx)
+				wg, ctx := errgroup.WithContext(ctx)
 
 				// data preparation for ChunkDict
 				useChunkDict := len(srcBlobs) != 0 && len(srcBlobs) >= LARGE_FILE_THRESHOLD
 				if useChunkDict {
-					startWorkerPipelineWithChunkDict(ctxIn, wgIn, workerState, srcBlobs, chResult, bufferPool, p)
+					startWorkerPipelineWithChunkDict(ctx, wg, workerState, srcBlobs, chResult, bufferPool, p)
 				} else {
-					startWorkerPipeline(ctxIn, wgIn, workerState, srcBlobs, chResult, bufferPool, p)
+					startWorkerPipeline(ctx, wg, workerState, srcBlobs, chResult, bufferPool, p)
 				}
 
-				err = wgIn.Wait()
+				err = wg.Wait()
 				if err != nil {
 					return err
 				}

@@ -12,7 +12,6 @@ import (
 	"github.com/restic/restic/internal/restic"
 	"github.com/restic/restic/internal/ui"
 	"github.com/restic/restic/internal/ui/progress"
-	"golang.org/x/sync/errgroup"
 
 	"github.com/spf13/cobra"
 	"github.com/spf13/pflag"
@@ -133,12 +132,10 @@ func runRechunkCopy(ctx context.Context, opts RechunkCopyOptions, gopts global.O
 	}
 
 	// run rechunk process
-	wg, wgCtx := errgroup.WithContext(ctx)
-	debug.Log("Starting pack uploader")
-	dstRepo.StartPackUploader(wgCtx, wg)
 	debug.Log("Running runRechunk()")
 	progress := rechunker.NewProgress(
 		term,
+		printer,
 		ui.CalculateProgressInterval(!gopts.Quiet, gopts.JSON, term.CanUpdateStatus()),
 	)
 	if err = runRechunk(ctx, srcRepo, rootTrees, dstRepo, rechnker, opts.CacheSize*(1<<20), printer, progress); err != nil {
@@ -146,20 +143,21 @@ func runRechunkCopy(ctx context.Context, opts RechunkCopyOptions, gopts global.O
 	}
 
 	// rewrite trees
-	printer.V("Rewriting trees...\n")
-	for sn := range FindFilteredSnapshots(ctx, srcSnapshotLister, srcRepo, &opts.SnapshotFilter, args, printer) {
-		debug.Log("Running RewriteTree() for tree ID %v", sn.Tree.Str())
-		_, err := rechnker.RewriteTree(ctx, srcRepo, dstRepo, *sn.Tree)
-		if err != nil {
-			return err
+	printer.P("Rewriting trees...\n")
+	err = dstRepo.WithBlobUploader(ctx, func(ctx context.Context, uploader restic.BlobSaver) error {
+		for sn := range FindFilteredSnapshots(ctx, srcSnapshotLister, srcRepo, &opts.SnapshotFilter, args, printer) {
+			debug.Log("Running RewriteTree() for tree ID %v", sn.Tree.Str())
+			_, err := rechnker.RewriteTree(ctx, srcRepo, uploader, *sn.Tree)
+			if err != nil {
+				return err
+			}
 		}
-	}
 
-	debug.Log("Flushing pack uploader")
-	if err = dstRepo.Flush(wgCtx); err != nil {
+		return nil
+	})
+	if err != nil {
 		return err
 	}
-
 	printer.V("Rewriting done.\n\n")
 
 	// write snapshots
@@ -189,28 +187,29 @@ func runRechunkCopy(ctx context.Context, opts RechunkCopyOptions, gopts global.O
 	}
 
 	// summary
-	printer.P("\n[Post-run Summary]")
-	printer.P("Number of distinct files processed: %v", rechnker.NumFiles())
-	printer.P("  - Total size processed (including duplicate blobs): %v", ui.FormatBytes(rechnker.TotalSize()))
-	printer.P("Added to the repository: %v", ui.FormatBytes(rechnker.TotalAddedToDstRepo()))
+	printer.V("\n[Post-run Summary]")
+	printer.V("Number of distinct files processed: %v", rechnker.NumFiles())
+	printer.V("  - Total size processed (including duplicate blobs): %v", ui.FormatBytes(rechnker.TotalSize()))
+	printer.P("Additional data stored to the repository: %v", ui.FormatBytes(rechnker.TotalAddedToDstRepo()))
 
 	return ctx.Err()
 }
 
 func runRechunk(ctx context.Context, srcRepo restic.Repository, roots []restic.ID, dstRepo restic.Repository, rechnker *rechunker.Rechunker, cacheSize int, printer progress.Printer, progress *rechunker.Progress) error {
-	printer.V("Preparing rechunking...\n")
+	printer.V("Planning rechunk...\n")
 	debug.Log("Running Plan()")
 	err := rechnker.Plan(ctx, srcRepo, roots, cacheSize != 0)
 	if err != nil {
 		return err
 	}
+	printer.V("Planning done.")
 
-	printer.P("\n[Pre-run Summary]")
+	printer.V("\n[Pre-run Summary]")
 	// num_snapshots, num_distinct_files, total_size, num_packs,
-	printer.P("Number of snapshots: %v", len(roots))
-	printer.P("Number of distinct files to process: %v", rechnker.NumFiles())
-	printer.P("  - Total size (including duplicate blobs): %v", ui.FormatBytes(rechnker.TotalSize()))
-	printer.P("Number of packs to download: %v", rechnker.PackCount())
+	printer.V("Number of snapshots: %v", len(roots))
+	printer.V("Number of distinct files to process: %v", rechnker.NumFiles())
+	printer.V("  - Total size (including duplicate blobs): %v", ui.FormatBytes(rechnker.TotalSize()))
+	printer.V("Number of packs to download: %v\n\n", rechnker.PackCount())
 
 	debug.Log("Running RechunkData()")
 	progress.Start(rechnker.NumFiles(), rechnker.TotalSize())
