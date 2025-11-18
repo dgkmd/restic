@@ -11,46 +11,6 @@ import (
 	"golang.org/x/sync/errgroup"
 )
 
-type ChunkedFile struct {
-	restic.IDs
-	hashval restic.ID
-}
-type blob struct {
-	buf       []byte
-	stNum     int
-	newStream bool
-}
-type fileStreamReader struct {
-	*io.PipeReader
-	stNum int
-}
-type chunk struct {
-	chunker.Chunk
-	stNum int
-}
-type fastForward struct {
-	newStNum int
-	blobIdx  int
-	offset   uint
-}
-type fileResult struct {
-	dstBlobs          restic.IDs
-	addedToRepository uint64
-}
-type blobLoadCallbackFn func(ids restic.IDs) error
-
-type rechunkWorkerState struct {
-	chunkDict  *ChunkDict
-	idx        *Index
-	chunker    *chunker.Chunker
-	pol        chunker.Pol
-	getBlob    getBlobFn
-	saveBlob   saveBlobFn
-	onBlobLoad blobLoadCallbackFn
-}
-
-var ErrNewStream = errors.New("new stream")
-
 func createBlobLoadCallback(ctx context.Context, c *BlobCache, idx *Index) blobLoadCallbackFn {
 	if c == nil {
 		return nil
@@ -58,14 +18,14 @@ func createBlobLoadCallback(ctx context.Context, c *BlobCache, idx *Index) blobL
 
 	return func(ids restic.IDs) error {
 		var ignoresList restic.IDs
-		idx.blobRemainingLock.Lock()
+		idx.blobRemainingNeedsLock.Lock()
 		for _, blob := range ids {
-			idx.blobRemaining[blob]--
-			if idx.blobRemaining[blob] == 0 {
+			idx.blobRemainingNeeds[blob]--
+			if idx.blobRemainingNeeds[blob] == 0 {
 				ignoresList = append(ignoresList, blob)
 			}
 		}
-		idx.blobRemainingLock.Unlock()
+		idx.blobRemainingNeedsLock.Unlock()
 
 		if len(ignoresList) > 0 {
 			return c.Ignore(ctx, ignoresList)
@@ -73,6 +33,11 @@ func createBlobLoadCallback(ctx context.Context, c *BlobCache, idx *Index) blobL
 
 		return nil
 	}
+}
+
+type ChunkedFile struct {
+	restic.IDs
+	hashval restic.ID
 }
 
 func prioritySelect(ctx context.Context, chFirst <-chan *ChunkedFile, chSecond <-chan *ChunkedFile) (file *ChunkedFile, ok bool, err error) {
@@ -112,6 +77,39 @@ func prioritySelect(ctx context.Context, chFirst <-chan *ChunkedFile, chSecond <
 
 	return file, ok, nil
 }
+
+type blob struct {
+	buf       []byte
+	stNum     int
+	newStream bool
+}
+type fileStreamReader struct {
+	*io.PipeReader
+	stNum int
+}
+type chunk struct {
+	chunker.Chunk
+	stNum int
+}
+type fastForward struct {
+	newStNum int
+	blobIdx  int
+	offset   uint
+}
+type fileResult struct {
+	dstBlobs          restic.IDs
+	addedToRepository uint64
+}
+type rechunkWorkerState struct {
+	chunkDict  *ChunkDict
+	idx        *Index
+	chunker    *chunker.Chunker
+	pol        chunker.Pol
+	getBlob    getBlobFn
+	saveBlob   saveBlobFn
+	onBlobLoad blobLoadCallbackFn
+}
+type blobLoadCallbackFn func(ids restic.IDs) error
 
 func startPipeline(ctx context.Context, wg *errgroup.Group, s *rechunkWorkerState, srcBlobs restic.IDs, out chan<- fileResult, bufferPool chan []byte, useChunkDict bool, p *Progress) {
 	chBlob := make(chan blob)
@@ -171,10 +169,7 @@ func prepareChunkDict(srcBlobs restic.IDs, d *ChunkDict, idx *Index) (h *chunkDi
 	if numFinishedBlobs > 0 {
 		// debugNote: record chunkdict prefix match event
 		debug.Log("ChunkDict prefix match at %v: Skipping %d blobs", srcBlobs[0].Str(), numFinishedBlobs)
-		debugNoteLock.Lock()
-		debugNote["chunkdict_event"]++
-		debugNote["chunkdict_blob_count"] += numFinishedBlobs
-		debugNoteLock.Unlock()
+		debugNote.AddMap(map[string]int{"chunkdict_event": 1, "chunkdict_blob_count": numFinishedBlobs})
 
 		prefixIdx = numFinishedBlobs
 		prefixPos = blobPos[prefixIdx] + newOffset
@@ -269,6 +264,8 @@ func startBlobLoader(ctx context.Context, wg *errgroup.Group, srcBlobs restic.ID
 	})
 }
 
+var ErrNewStream = errors.New("new stream")
+
 func startFileStreamer(ctx context.Context, wg *errgroup.Group, in <-chan blob, out chan<- fileStreamReader, bufferPool chan []byte) {
 	wg.Go(func() error {
 		r, w := io.Pipe()
@@ -306,7 +303,7 @@ func startFileStreamer(ctx context.Context, wg *errgroup.Group, in <-chan blob, 
 				}
 			}
 
-			// stream-write through io.pipe
+			// stream-write to io.pipe
 			buf := b.buf
 			_, err := w.Write(buf)
 			if err != nil {
@@ -406,7 +403,7 @@ func startBlobSaver(ctx context.Context, wg *errgroup.Group, in <-chan chunk, ou
 			}
 
 			if c.stNum < stNum {
-				// just arrived chunk had been skipped by chunkDict match,
+				// just arrived chunk had been skipped by a chunkDict match,
 				// so just flush it away and receive next chunk
 				debug.Log("Chunk of obsolete stNum received; discarding.")
 				select {

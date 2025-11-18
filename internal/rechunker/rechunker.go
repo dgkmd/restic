@@ -18,25 +18,11 @@ import (
 	"golang.org/x/sync/errgroup"
 )
 
-const SMALL_FILE_THRESHOLD = 50
-const LARGE_FILE_THRESHOLD = 50
+const SMALL_FILE_THRESHOLD = 50 // files less than the threshold will be prioritized when all blobs are ready in the cache
+const LARGE_FILE_THRESHOLD = 50 // files larger than the threshold is applicable to ChunkDict
 
 // data structure for debug trace
-var debugNote = map[string]int{}
-var debugNoteLock = sync.Mutex{}
-
-type getBlobFn func(blobID restic.ID, buf []byte, prefetch restic.IDs) ([]byte, error)
-type saveBlobFn func(context.Context, restic.BlobType, []byte, restic.ID, bool) (restic.ID, bool, int, error)
-
-type SrcRepo interface {
-	restic.BlobLoader
-	LoadBlobsFromPack(ctx context.Context, packID restic.ID, blobs []restic.Blob, handleBlobFn func(blob restic.BlobHandle, buf []byte, err error) error) error
-	Connections() uint
-}
-
-type DstRepo interface {
-	restic.WithBlobUploader
-}
+var debugNote = newDebugNote()
 
 type Rechunker struct {
 	pol                  chunker.Pol
@@ -64,10 +50,10 @@ type Index struct {
 	sfBlobToFiles map[restic.ID][]*ChunkedFile // pack ID -> list of files{srcBlobIDs, hashOfIDs} that contains any blob in the pack (small files only)
 
 	// dynamic states
-	blobRemaining      map[restic.ID]int
-	blobRemainingLock  sync.Mutex
-	sfBlobRequires     map[restic.ID]int // hashOfIDs of srcBlobIDs -> number of packs until all blobs become ready in the cache (small files only)
-	sfBlobRequiresLock sync.Mutex
+	blobRemainingNeeds     map[restic.ID]int
+	blobRemainingNeedsLock sync.Mutex
+	sfBlobRequires         map[restic.ID]int // hashOfIDs of srcBlobIDs -> number of packs until all blobs become ready in the cache (small files only)
+	sfBlobRequiresLock     sync.Mutex
 }
 
 func NewRechunker(pol chunker.Pol) *Rechunker {
@@ -77,6 +63,16 @@ func NewRechunker(pol chunker.Pol) *Rechunker {
 		rechunkMap:     map[restic.ID]restic.IDs{},
 		rewriteTreeMap: map[restic.ID]restic.ID{},
 	}
+}
+
+func (rc *Rechunker) reset() {
+	rc.cache = nil
+	rc.priorityFilesHandler = nil
+
+	rc.filesList = nil
+	rc.rechunkReady = false
+
+	rc.idx = nil
 }
 
 func (rc *Rechunker) Plan(ctx context.Context, srcRepo restic.Repository, rootTrees []restic.ID, useBlobCache bool) error {
@@ -115,6 +111,132 @@ func (rc *Rechunker) Plan(ctx context.Context, srcRepo restic.Repository, rootTr
 
 	return nil
 }
+
+func gatherFileContents(ctx context.Context, repo restic.Repository, rootTrees restic.IDs, visitedFiles restic.IDSet, visitedTrees restic.IDSet) (filesList []*ChunkedFile, totalSize uint64, err error) {
+	wg, ctx := errgroup.WithContext(ctx)
+
+	// create StreamTrees channel that streams through all subtrees in target snapshots
+	treeStream := data.StreamTrees(ctx, wg, repo, rootTrees, func(id restic.ID) bool {
+		visited := visitedTrees.Has(id)
+		visitedTrees.Insert(id)
+		return visited
+	}, nil)
+
+	// gather all distinct file Contents under trees
+	wg.Go(func() error {
+		for tree := range treeStream {
+			if tree.Error != nil {
+				return tree.Error
+			}
+
+			// check if the tree blob is unstable json
+			buf, err := json.Marshal(tree.Tree)
+			if err != nil {
+				return err
+			}
+			buf = append(buf, '\n')
+			if tree.ID != restic.Hash(buf) {
+				return fmt.Errorf("can't run rechunk-copy, because the following tree can't be rewritten without losing information:\n%v", tree.ID.String())
+			}
+
+			for _, node := range tree.Nodes {
+				// you only have to rechunk regular files; so skip other file types
+				if node.Type == data.NodeTypeFile {
+					hashval := HashOfIDs(node.Content)
+					if visitedFiles.Has(hashval) {
+						continue
+					}
+					visitedFiles.Insert(hashval)
+
+					filesList = append(filesList, &ChunkedFile{
+						node.Content,
+						hashval,
+					})
+					totalSize += node.Size
+				}
+			}
+		}
+		return nil
+	})
+	err = wg.Wait()
+	if err != nil {
+		return nil, 0, err
+	}
+	return filesList, totalSize, nil
+}
+
+func createIndex(filesList []*ChunkedFile, lookupBlob func(t restic.BlobType, id restic.ID) []restic.PackedBlob, useBlobCache bool) (idx *Index, err error) {
+	// collect blob usage info
+	blobRemaining := map[restic.ID]int{}
+	for _, file := range filesList {
+		for _, blob := range file.IDs {
+			blobRemaining[blob]++
+		}
+	}
+
+	// debugNote: record the number of blobs used
+	debugNote.Add("total_blob_count", len(blobRemaining))
+
+	// build blob lookup info
+	blobSize := map[restic.ID]uint{}
+	blobToPack := map[restic.ID]restic.ID{}
+	packToBlobs := map[restic.ID][]restic.Blob{}
+	for blob := range blobRemaining {
+		packs := lookupBlob(restic.DataBlob, blob)
+		if len(packs) == 0 {
+			return nil, fmt.Errorf("can't find blob from source repo: %v", blob)
+		}
+		pb := packs[0]
+
+		blobSize[pb.Blob.ID] = pb.DataLength()
+		blobToPack[pb.Blob.ID] = pb.PackID
+		packToBlobs[pb.PackID] = append(packToBlobs[pb.PackID], pb.Blob)
+	}
+
+	idx = &Index{
+		blobSize:           blobSize,
+		blobToPack:         blobToPack,
+		packToBlobs:        packToBlobs,
+		blobRemainingNeeds: blobRemaining,
+	}
+
+	if !useBlobCache { // that's all you need if blob cache is disabled
+		return idx, nil
+	}
+
+	// build blob trace info for small files
+	// if blob cache is enabled, Rechunker tracks small files' remaining number of
+	// blobs until all blobs are readily available in the cache (sfBlobRequires);
+	// when the file has all its blobs ready, it is prioritized to be processed first.
+	// this logic is handled by rc.priorityFilesHandler.
+	sfBlobRequires := map[restic.ID]int{}
+	sfBlobToFiles := map[restic.ID][]*ChunkedFile{}
+	for _, file := range filesList {
+		if file.Len() >= SMALL_FILE_THRESHOLD {
+			continue
+		}
+		blobSet := restic.NewIDSet(file.IDs...)
+		sfBlobRequires[file.hashval] = len(blobSet)
+		for b := range blobSet {
+			sfBlobToFiles[b] = append(sfBlobToFiles[b], file)
+		}
+	}
+
+	idx.sfBlobRequires = sfBlobRequires
+	idx.sfBlobToFiles = sfBlobToFiles
+
+	return idx, nil
+}
+
+type SrcRepo interface {
+	restic.BlobLoader
+	LoadBlobsFromPack(ctx context.Context, packID restic.ID, blobs []restic.Blob, handleBlobFn func(blob restic.BlobHandle, buf []byte, err error) error) error
+	Connections() uint
+}
+type DstRepo interface {
+	restic.WithBlobUploader
+}
+type getBlobFn func(blobID restic.ID, buf []byte, prefetch restic.IDs) ([]byte, error)
 
 func (rc *Rechunker) RechunkData(ctx context.Context, srcRepo SrcRepo, dstRepo DstRepo, cacheSize int, p *Progress) error {
 	if !rc.rechunkReady {
@@ -183,203 +305,13 @@ func (rc *Rechunker) RechunkData(ctx context.Context, srcRepo SrcRepo, dstRepo D
 	}
 	debug.Log("All rechunk jobs done.")
 
-	// cleanup cache
+	// stop cache
 	rc.cache.Close()
 
-	// print debug.Log report
+	// print debug log summary
 	debugPrintRechunkReport(rc)
 
 	return nil
-}
-
-func (rc *Rechunker) RewriteTree(ctx context.Context, srcRepo restic.BlobLoader, dstRepo restic.BlobSaver, nodeID restic.ID) (restic.ID, error) {
-	// check if the identical tree has already been processed
-	newID, ok := rc.rewriteTreeMap[nodeID]
-	if ok {
-		return newID, nil
-	}
-
-	curTree, err := data.LoadTree(ctx, srcRepo, nodeID)
-	if err != nil {
-		return restic.ID{}, err
-	}
-
-	tb := data.NewTreeJSONBuilder()
-	for _, node := range curTree.Nodes {
-		if ctx.Err() != nil {
-			return restic.ID{}, ctx.Err()
-		}
-
-		err = rc.rewriteNode(node)
-		if err != nil {
-			return restic.ID{}, err
-		}
-
-		// if the node is non-directory node, add it to the tree
-		if node.Type != data.NodeTypeDir {
-			err = tb.AddNode(node)
-			if err != nil {
-				return restic.ID{}, err
-			}
-			continue
-		}
-
-		// if the node is directory node, rewrite it recursively
-		subtree := *node.Subtree
-		newID, err := rc.RewriteTree(ctx, srcRepo, dstRepo, subtree)
-		if err != nil {
-			return restic.ID{}, err
-		}
-		node.Subtree = &newID
-		err = tb.AddNode(node)
-		if err != nil {
-			return restic.ID{}, err
-		}
-	}
-
-	tree, err := tb.Finalize()
-	if err != nil {
-		return restic.ID{}, err
-	}
-
-	// save new tree to the destination repo
-	newTreeID, known, size, err := dstRepo.SaveBlob(ctx, restic.TreeBlob, tree, restic.ID{}, false)
-	if err != nil {
-		return restic.ID{}, err
-	}
-	rc.rewriteTreeMap[nodeID] = newTreeID
-
-	if !known {
-		rc.totalAddedToDstRepo.Add(uint64(size))
-	}
-
-	return newTreeID, err
-}
-
-func (rc *Rechunker) reset() {
-	rc.cache = nil
-	rc.priorityFilesHandler = nil
-
-	rc.filesList = nil
-	rc.rechunkReady = false
-
-	rc.idx = nil
-}
-
-func gatherFileContents(ctx context.Context, repo restic.Repository, rootTrees restic.IDs, visitedFiles restic.IDSet, visitedTrees restic.IDSet) (filesList []*ChunkedFile, totalSize uint64, err error) {
-	wg, ctx := errgroup.WithContext(ctx)
-
-	// create StreamTrees channel that streams through all subtrees in target snapshots
-	treeStream := data.StreamTrees(ctx, wg, repo, rootTrees, func(id restic.ID) bool {
-		visited := visitedTrees.Has(id)
-		visitedTrees.Insert(id)
-		return visited
-	}, nil)
-
-	// gather all distinct file Contents under trees
-	wg.Go(func() error {
-		for tree := range treeStream {
-			if tree.Error != nil {
-				return tree.Error
-			}
-
-			// check if the tree blob is unstable json
-			buf, err := json.Marshal(tree.Tree)
-			if err != nil {
-				return err
-			}
-			buf = append(buf, '\n')
-			if tree.ID != restic.Hash(buf) {
-				return fmt.Errorf("can't run rechunk-copy, because the following tree can't be rewritten without losing information:\n%v", tree.ID.String())
-			}
-
-			for _, node := range tree.Nodes {
-				// you only have to rechunk regular files; so skip other file types
-				if node.Type == data.NodeTypeFile {
-					hashval := HashOfIDs(node.Content)
-					if visitedFiles.Has(hashval) {
-						continue
-					}
-					visitedFiles.Insert(hashval)
-
-					filesList = append(filesList, &ChunkedFile{
-						node.Content,
-						hashval,
-					})
-					totalSize += node.Size
-				}
-			}
-		}
-		return nil
-	})
-	err = wg.Wait()
-	if err != nil {
-		return nil, 0, err
-	}
-	return filesList, totalSize, nil
-}
-
-func createIndex(filesList []*ChunkedFile, lookupBlob func(t restic.BlobType, id restic.ID) []restic.PackedBlob, useBlobCache bool) (idx *Index, err error) {
-	// collect blob usage info
-	blobRemaining := map[restic.ID]int{}
-	for _, file := range filesList {
-		for _, blob := range file.IDs {
-			blobRemaining[blob]++
-		}
-	}
-
-	// debugNote: record the number of blobs used
-	debugNote["total_blob_count"] = len(blobRemaining)
-
-	// build blob lookup info
-	blobSize := map[restic.ID]uint{}
-	blobToPack := map[restic.ID]restic.ID{}
-	packToBlobs := map[restic.ID][]restic.Blob{}
-	for blob := range blobRemaining {
-		packs := lookupBlob(restic.DataBlob, blob)
-		if len(packs) == 0 {
-			return nil, fmt.Errorf("can't find blob from source repo: %v", blob)
-		}
-		pb := packs[0]
-
-		blobSize[pb.Blob.ID] = pb.DataLength()
-		blobToPack[pb.Blob.ID] = pb.PackID
-		packToBlobs[pb.PackID] = append(packToBlobs[pb.PackID], pb.Blob)
-	}
-
-	idx = &Index{
-		blobSize:      blobSize,
-		blobToPack:    blobToPack,
-		packToBlobs:   packToBlobs,
-		blobRemaining: blobRemaining,
-	}
-
-	if !useBlobCache { // that's all you need if blob cache is disabled
-		return idx, nil
-	}
-
-	// build blob trace info for small files
-	// if blob cache is enabled, Rechunker tracks small files' remaining number of
-	// blobs until all blobs are readily available in the cache (sfBlobRequires);
-	// when the file has all its blobs ready, it is prioritized to be processed first.
-	// this logic is handled by rc.priorityFilesHandler.
-	sfBlobRequires := map[restic.ID]int{}
-	sfBlobToFiles := map[restic.ID][]*ChunkedFile{}
-	for _, file := range filesList {
-		if file.Len() >= SMALL_FILE_THRESHOLD {
-			continue
-		}
-		blobSet := restic.NewIDSet(file.IDs...)
-		sfBlobRequires[file.hashval] = len(blobSet)
-		for b := range blobSet {
-			sfBlobToFiles[b] = append(sfBlobToFiles[b], file)
-		}
-	}
-
-	idx.sfBlobRequires = sfBlobRequires
-	idx.sfBlobToFiles = sfBlobToFiles
-
-	return idx, nil
 }
 
 func startCache(ctx context.Context, srcRepo SrcRepo, idx *Index, numDownloaders int, cacheSize int) (*BlobCache, *PriorityFilesHandler) {
@@ -416,11 +348,11 @@ func startCache(ctx context.Context, srcRepo SrcRepo, idx *Index, numDownloaders
 			}
 
 			// debugNote: trace blob load count
-			debugNoteLock.Lock()
+			dAdds := map[string]int{}
 			for _, id := range blobIDs {
-				debugNote["load:"+id.String()]++
+				dAdds["load:"+id.String()]++
 			}
-			debugNoteLock.Unlock()
+			debugNote.AddMap(dAdds)
 		}, func(blobIDs restic.IDs) {
 			// onEvict() implementation
 			// when a blob is evicted, (small) files containing that blob has
@@ -445,10 +377,7 @@ func startCache(ctx context.Context, srcRepo SrcRepo, idx *Index, numDownloaders
 }
 
 func startDispatcher(ctx context.Context, wg *errgroup.Group, filesList []*ChunkedFile, cache *BlobCache, priorityFilesHandler *PriorityFilesHandler) (chRegular, chPriority <-chan *ChunkedFile) {
-	if cache != nil {
-		// if cache is enabled
-
-		// visited files set shared among dispatchers
+	if cache != nil { // if cache is enabled
 		visitedFiles := restic.IDSet{}
 		visitedFilesLock := sync.Mutex{}
 
@@ -479,7 +408,6 @@ func startDispatcher(ctx context.Context, wg *errgroup.Group, filesList []*Chunk
 		})
 	} else {
 		// if cache is disabled: use regular track only
-
 		chRegular = createFilesListDispatchChannel(ctx, wg, filesList, nil, nil)
 	}
 
@@ -555,6 +483,8 @@ func createPriorityDispatchChannel(ctx context.Context, wg *errgroup.Group, h *P
 	return ch
 }
 
+type saveBlobFn func(context.Context, restic.BlobType, []byte, restic.ID, bool) (restic.ID, bool, int, error)
+
 func (rc *Rechunker) runWorkers(ctx context.Context, wg *errgroup.Group, numWorkers int, getBlob getBlobFn, saveBlob saveBlobFn, onBlobLoad blobLoadCallbackFn, chFirst <-chan *ChunkedFile, chSecond <-chan *ChunkedFile, p *Progress) {
 	if chFirst == nil { // assertion
 		panic("chFirst must not be nil")
@@ -611,7 +541,6 @@ func (rc *Rechunker) runWorkers(ctx context.Context, wg *errgroup.Group, numWork
 				rc.rechunkMap[hashval] = dstBlobs
 				rc.rechunkMapLock.Unlock()
 
-				// update totalAddedToDstRepo size
 				_ = rc.totalAddedToDstRepo.Add(addedToRepo)
 
 				if p != nil {
@@ -620,6 +549,70 @@ func (rc *Rechunker) runWorkers(ctx context.Context, wg *errgroup.Group, numWork
 			}
 		})
 	}
+}
+
+func (rc *Rechunker) RewriteTree(ctx context.Context, srcRepo restic.BlobLoader, dstRepo restic.BlobSaver, nodeID restic.ID) (restic.ID, error) {
+	// check if the identical tree has already been processed
+	newID, ok := rc.rewriteTreeMap[nodeID]
+	if ok {
+		return newID, nil
+	}
+
+	curTree, err := data.LoadTree(ctx, srcRepo, nodeID)
+	if err != nil {
+		return restic.ID{}, err
+	}
+
+	tb := data.NewTreeJSONBuilder()
+	for _, node := range curTree.Nodes {
+		if ctx.Err() != nil {
+			return restic.ID{}, ctx.Err()
+		}
+
+		err = rc.rewriteNode(node)
+		if err != nil {
+			return restic.ID{}, err
+		}
+
+		// if the node is non-directory node, add it to the tree
+		if node.Type != data.NodeTypeDir {
+			err = tb.AddNode(node)
+			if err != nil {
+				return restic.ID{}, err
+			}
+			continue
+		}
+
+		// if the node is directory node, rewrite it recursively
+		subtree := *node.Subtree
+		newID, err := rc.RewriteTree(ctx, srcRepo, dstRepo, subtree)
+		if err != nil {
+			return restic.ID{}, err
+		}
+		node.Subtree = &newID
+		err = tb.AddNode(node)
+		if err != nil {
+			return restic.ID{}, err
+		}
+	}
+
+	tree, err := tb.Finalize()
+	if err != nil {
+		return restic.ID{}, err
+	}
+
+	// save new tree to the destination repo
+	newTreeID, known, size, err := dstRepo.SaveBlob(ctx, restic.TreeBlob, tree, restic.ID{}, false)
+	if err != nil {
+		return restic.ID{}, err
+	}
+	rc.rewriteTreeMap[nodeID] = newTreeID
+
+	if !known {
+		rc.totalAddedToDstRepo.Add(uint64(size))
+	}
+
+	return newTreeID, err
 }
 
 func (rc *Rechunker) rewriteNode(node *data.Node) error {
@@ -669,23 +662,24 @@ func HashOfIDs(ids restic.IDs) restic.ID {
 }
 
 func debugPrintRechunkReport(rc *Rechunker) {
+	dNote := debugNote.d
 	if rc.cache != nil {
 		debug.Log("List of blobs downloaded more than once:")
 		numBlobRedundant := 0
 		redundantDownloadCount := 0
-		for k := range debugNote {
-			if strings.HasPrefix(k, "load:") && debugNote[k] > 1 {
-				debug.Log("%v: Downloaded %d times", k[5:15], debugNote[k])
+		for k := range dNote {
+			if strings.HasPrefix(k, "load:") && dNote[k] > 1 {
+				debug.Log("%v: Downloaded %d times", k[5:15], dNote[k])
 				numBlobRedundant++
-				redundantDownloadCount += debugNote[k]
+				redundantDownloadCount += dNote[k]
 			}
 		}
 		debug.Log("[summary_blobcache] Number of redundantly downloaded blobs is %d, whose overall download count is %d", numBlobRedundant, redundantDownloadCount)
-		debug.Log("[summary_blobcache] Peak memory usage by blob cache: %v/%v bytes", debugNote["max_cache_usage"], rc.cache.size)
-		if debugNote["total_blob_count"] != debugNote["ignored_blob_count"] {
-			debug.Log("[summary_blobcache] WARNING: Number of successfully ignored blob at the end: %v/%v", debugNote["ignored_blob_count"], debugNote["total_blob_count"])
+		debug.Log("[summary_blobcache] Peak memory usage by blob cache: %v/%v bytes", dNote["max_cache_usage"], rc.cache.size)
+		if dNote["total_blob_count"] != dNote["ignored_blob_count"] {
+			debug.Log("[summary_blobcache] WARNING: Number of successfully ignored blob at the end: %v/%v", dNote["ignored_blob_count"], dNote["total_blob_count"])
 		}
 	}
-	debug.Log("[summary_chunkdict] ChunkDict match happend %d times, saving %d blob processings", debugNote["chunkdict_event"], debugNote["chunkdict_blob_count"])
+	debug.Log("[summary_chunkdict] ChunkDict match happend %d times, saving %d blob processings", dNote["chunkdict_event"], dNote["chunkdict_blob_count"])
 
 }

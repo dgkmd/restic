@@ -205,10 +205,7 @@ func (h *chunkDictHelper) Retrieve() (matchedBlobs restic.IDs, length uint) {
 	if numFinishedSrcBlobs > 4 { // apply only when you can skip many blobs; otherwise, it would be better not to interrupt the pipeline
 		// debug trace
 		debug.Log("ChunkDict match at %v: Skipping %d blobs", h.srcBlobs[h.currIdx].Str(), numFinishedSrcBlobs)
-		debugNoteLock.Lock()
-		debugNote["chunkdict_event"]++
-		debugNote["chunkdict_blob_count"] += numFinishedSrcBlobs
-		debugNoteLock.Unlock()
+		debugNote.AddMap(map[string]int{"chunkdict_event": 1, "chunkdict_blob_count": numFinishedSrcBlobs})
 
 		// compute new idx and pos
 		oldPos := h.blobPos[h.currIdx] + h.currOffset
