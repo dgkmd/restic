@@ -160,16 +160,14 @@ func (rc *Rechunker) RechunkData(ctx context.Context, srcRepo SrcRepo, dstRepo D
 
 		wg, ctx := errgroup.WithContext(ctx)
 
-		saveBlob := uploader.SaveBlob
-
 		if rc.cache != nil {
-			rc.runWorkers(ctx, wg, numWorkers, getBlob, saveBlob, onBlobLoad, chPriority, chRegular, p)
+			rc.runWorkers(ctx, wg, numWorkers, getBlob, uploader.SaveBlob, onBlobLoad, chPriority, chRegular, p)
 
 			// below is a dedicated worker that only processes priority files;
 			// it relieves pressure on chPriority even when all other workers are stuck processing (large) chRegular files
-			rc.runWorkers(ctx, wg, 1, getBlob, saveBlob, onBlobLoad, chPriority, nil, p)
+			rc.runWorkers(ctx, wg, 1, getBlob, uploader.SaveBlob, onBlobLoad, chPriority, nil, p)
 		} else {
-			rc.runWorkers(ctx, wg, numWorkers, getBlob, saveBlob, onBlobLoad, chRegular, nil, p)
+			rc.runWorkers(ctx, wg, numWorkers, getBlob, uploader.SaveBlob, onBlobLoad, chRegular, nil, p)
 		}
 
 		return wg.Wait()
@@ -246,6 +244,9 @@ func (rc *Rechunker) RewriteTree(ctx context.Context, srcRepo restic.BlobLoader,
 
 	// save new tree to the destination repo
 	newTreeID, known, size, err := dstRepo.SaveBlob(ctx, restic.TreeBlob, tree, restic.ID{}, false)
+	if err != nil {
+		return restic.ID{}, err
+	}
 	rc.rewriteTreeMap[nodeID] = newTreeID
 
 	if !known {
@@ -588,13 +589,9 @@ func (rc *Rechunker) runWorkers(ctx context.Context, wg *errgroup.Group, numWork
 
 				wg, ctx := errgroup.WithContext(ctx)
 
-				// data preparation for ChunkDict
+				// run pipeline for a file
 				useChunkDict := len(srcBlobs) != 0 && len(srcBlobs) >= LARGE_FILE_THRESHOLD
-				if useChunkDict {
-					startWorkerPipelineWithChunkDict(ctx, wg, workerState, srcBlobs, chResult, bufferPool, p)
-				} else {
-					startWorkerPipeline(ctx, wg, workerState, srcBlobs, chResult, bufferPool, p)
-				}
+				startPipeline(ctx, wg, workerState, srcBlobs, chResult, bufferPool, useChunkDict, p)
 
 				err = wg.Wait()
 				if err != nil {

@@ -102,17 +102,17 @@ func TestRechunkerRechunkData(t *testing.T) {
 		"0": {},
 		"1": rtest.Random(1, 10_000),
 		"2": rtest.Random(4, 10_000_000),
-		"3": rtest.Random(5, 100_000_000),
+		"3": rtest.Random(5, 150_000_000),
 	}
 	files["2_duplicate"] = files["2"]
-	prefixChanged := make([]byte, 0, 100_500_000)
-	prefixChanged = append(prefixChanged, rtest.Random(6, 1_000_000)...)
-	prefixChanged = append(prefixChanged, files["3"][500_000:]...)
-	files["3_prefix_changed"] = prefixChanged
-	suffixChanged := make([]byte, 0, 99_500_000)
-	suffixChanged = append(suffixChanged, files["3"][:99_000_000]...)
-	suffixChanged = append(suffixChanged, rtest.Random(7, 500_000)...)
-	files["3_suffix_changed"] = suffixChanged
+	headChanged := make([]byte, 0, 120_000_000)
+	headChanged = append(headChanged, rtest.Random(6, 10_000_000)...)
+	headChanged = append(headChanged, files["3"][40_000_000:]...)
+	files["3_head_changed"] = headChanged
+	tailChanged := make([]byte, 0, 100_000_000)
+	tailChanged = append(tailChanged, files["3"][:90_000_000]...)
+	tailChanged = append(tailChanged, rtest.Random(7, 10_000_000)...)
+	files["3_tail_changed"] = tailChanged
 
 	// prepare chunker and minimal repositories
 	chnker := chunker.New(nil, 0)

@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"sync"
 
+	"github.com/restic/restic/internal/debug"
 	"github.com/restic/restic/internal/restic"
 )
 
@@ -26,20 +27,7 @@ type linkTable map[uint]link
 // the value is a linkTable for that srcBlob.
 type dictIndex map[restic.ID]linkTable
 
-type seekBlobPosFn func(pos uint, seekStartIdx int) (idx int, offset uint)                                               // given pos in a file, find blob idx and offset
-type dictStoreFn func(srcBlobs restic.IDs, startOffset, endOffset uint, dstBlob restic.ID) error                         // store a blob mapping to ChunkDict
-type dictMatchFn func(srcBlobs restic.IDs, startOffset uint) (dstBlobs restic.IDs, numFinishedBlobs int, newOffset uint) // get matching blob mapping from ChunkDict
-
-// ChunkedFileContext has variables and functions needed for use in rechunk workers with ChunkDict.
-type ChunkedFileContext struct {
-	srcBlobs    restic.IDs
-	blobPos     []uint        // file position of each blob's start
-	seekBlobPos seekBlobPosFn // maps file position to blob position
-	dictStore   dictStoreFn
-	dictMatch   dictMatchFn
-	prefixPos   uint
-	prefixIdx   int
-}
+type seekBlobPosFn func(pos uint, seekStartIdx int) (idx int, offset uint) // given pos in a file, find blob idx and offset
 
 type ChunkDict struct {
 	idx dictIndex
@@ -168,4 +156,68 @@ func (cd *ChunkDict) Store(srcBlobs restic.IDs, startOffset, endOffset uint, dst
 	}
 
 	return nil
+}
+
+// chunkDictHelper has variables and functions needed for use in rechunk workers with ChunkDict.
+type chunkDictHelper struct {
+	d *ChunkDict
+
+	srcBlobs    restic.IDs
+	blobPos     []uint        // file position of each blob's start
+	seekBlobPos seekBlobPosFn // maps file position to blob position
+
+	currIdx    int
+	currOffset uint
+}
+
+func (h *chunkDictHelper) Update(id restic.ID, length uint) error {
+	endPos := h.blobPos[h.currIdx] + h.currOffset + length
+	endIdx, endOffset := h.seekBlobPos(endPos, h.currIdx)
+
+	// slice srcBlobs which corresponds to current chunk into chunkSrcBlobs
+	var chunkSrcBlobs restic.IDs
+	if endIdx == len(h.srcBlobs) { // tail-of-file chunk
+		// last element of chunkSrcBlobs should be nullID, which indicates EOF
+		chunkSrcBlobs = make(restic.IDs, endIdx-h.currIdx+1)
+		n := copy(chunkSrcBlobs, h.srcBlobs[h.currIdx:endIdx])
+		if n != endIdx-h.currIdx {
+			panic("srcBlobs slice copy error")
+		}
+	} else { // mid-file chunk
+		chunkSrcBlobs = h.srcBlobs[h.currIdx : endIdx+1]
+	}
+
+	// store chunk mapping to ChunkDict
+	err := h.d.Store(chunkSrcBlobs, h.currOffset, endOffset, id)
+	if err != nil {
+		return err
+	}
+
+	// update current position in a file
+	h.currOffset = endOffset
+	h.currIdx = endIdx
+
+	return nil
+}
+
+func (h *chunkDictHelper) Retrieve() (matchedBlobs restic.IDs, length uint) {
+	matchedDstBlobs, numFinishedSrcBlobs, newOffset := h.d.Match(h.srcBlobs[h.currIdx:], h.currOffset)
+	if numFinishedSrcBlobs > 4 { // apply only when you can skip many blobs; otherwise, it would be better not to interrupt the pipeline
+		// debug trace
+		debug.Log("ChunkDict match at %v: Skipping %d blobs", h.srcBlobs[h.currIdx].Str(), numFinishedSrcBlobs)
+		debugNoteLock.Lock()
+		debugNote["chunkdict_event"]++
+		debugNote["chunkdict_blob_count"] += numFinishedSrcBlobs
+		debugNoteLock.Unlock()
+
+		// compute new idx and pos
+		oldPos := h.blobPos[h.currIdx] + h.currOffset
+		h.currIdx += numFinishedSrcBlobs
+		h.currOffset = newOffset
+		newPos := h.blobPos[h.currIdx] + h.currOffset
+		length := newPos - oldPos
+
+		return matchedDstBlobs, length
+	}
+	return nil, 0
 }
