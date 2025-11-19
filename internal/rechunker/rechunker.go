@@ -22,7 +22,7 @@ const SMALL_FILE_THRESHOLD = 50 // files less than the threshold will be priorit
 const LARGE_FILE_THRESHOLD = 50 // files larger than the threshold is applicable to ChunkDict
 
 // data structure for debug trace
-var debugNote = newDebugNote()
+var debugNote = newDebugNote(true)
 
 type Rechunker struct {
 	pol                  chunker.Pol
@@ -662,7 +662,11 @@ func HashOfIDs(ids restic.IDs) restic.ID {
 }
 
 func debugPrintRechunkReport(rc *Rechunker) {
-	dNote := debugNote.d
+	dNote := debugNote.Dump()
+	if dNote == nil {
+		return
+	}
+
 	if rc.cache != nil {
 		debug.Log("List of blobs downloaded more than once:")
 		numBlobRedundant := 0
