@@ -278,6 +278,7 @@ func (s *Scheduler) SetObsoleteBlobCallback(cb func(restic.IDs)) {
 	s.obsoleteBlobCB = cb
 }
 
+// ReadProgress computes progress of cursor for a file, while inferring src blob consumption and using that info to track blob usage.
 func (s *Scheduler) ReadProgress(cursor Cursor, bytesProcessed uint) (Cursor, error) {
 	start := cursor
 	end, err := AdvanceCursor(cursor, bytesProcessed, s.idx.BlobSize)
@@ -308,9 +309,8 @@ func (s *Scheduler) ReadProgress(cursor Cursor, bytesProcessed uint) (Cursor, er
 		return end, nil
 	}
 
-	if s.obsoleteBlobCB != nil {
-		s.obsoleteBlobCB(obsolete)
-	}
+	s.obsoleteBlobCB(obsolete)
+
 	return end, nil
 }
 

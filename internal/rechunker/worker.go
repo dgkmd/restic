@@ -51,7 +51,7 @@ func (w *Worker) RunFile(ctx context.Context, srcBlobs restic.IDs, p *Progress) 
 	wg, ctx := errgroup.WithContext(ctx)
 
 	chChunk := make(chan chunker.Chunk)  // chunk passing channel from reader to writer
-	chResult := make(chan FileResult, 1) // file chunk result channel
+	chResult := make(chan FileResult, 1) // file rechunk result channel
 
 	// Run reader goroutine
 	w.runReader(ctx, wg, srcBlobs, reader, chChunk)
@@ -101,7 +101,7 @@ func (w *Worker) runReader(ctx context.Context, wg *errgroup.Group, srcBlobs res
 				}
 			}
 
-			// send chunk to writer
+			// send a rechunked chunk to the writer
 			select {
 			case <-ctx.Done():
 				return ctx.Err()
@@ -121,7 +121,7 @@ func (w *Worker) runWriter(ctx context.Context, wg *errgroup.Group, in <-chan ch
 		var addedSize uint64
 
 		for {
-			// receive chunk from reader
+			// receive chunk from the reader
 			var c chunker.Chunk
 			var ok bool
 			select {

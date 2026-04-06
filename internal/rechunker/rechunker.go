@@ -388,6 +388,7 @@ func (rc *Rechunker) TotalAddedToDstRepo() uint64 {
 	return rc.totalAddedToDstRepo.Load()
 }
 
+// HashOfIDs computes a sha256 hash of the concatenation of all values of `restic.IDs`, making a mapping from `restic.IDs` to `restic.ID`.
 func HashOfIDs(ids restic.IDs) restic.ID {
 	c := make([]byte, 0, len(ids)*32)
 	for _, id := range ids {
