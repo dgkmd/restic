@@ -93,9 +93,11 @@ func TestCopy(t *testing.T) {
 
 	// Check that the copied snapshots have the same tree contents as the old ones (= identical tree hash)
 	origRestores := make(map[string]struct{})
+	origRestores2 := make(map[string]struct{})
 	for i, snapshotID := range snapshotIDs {
 		restoredir := filepath.Join(env.base, fmt.Sprintf("restore%d", i))
 		origRestores[restoredir] = struct{}{}
+		origRestores2[restoredir] = struct{}{}
 		testRunRestore(t, env.gopts, restoredir, snapshotID.String())
 	}
 	for i, snapshotID := range copiedSnapshotIDs {
@@ -113,13 +115,7 @@ func TestCopy(t *testing.T) {
 		rtest.Assert(t, foundMatch, "found no counterpart for snapshot %v", snapshotID)
 	}
 
-	// Check that the rechunk-copied snapshots have the same tree contents as the old ones (= identical tree hash)
-	origRestores2 := make(map[string]struct{})
-	for i, snapshotID := range snapshotIDs {
-		restoredir := filepath.Join(env.base, fmt.Sprintf("restore%d", i))
-		origRestores2[restoredir] = struct{}{}
-		testRunRestore(t, env.gopts, restoredir, snapshotID.String())
-	}
+	// Check that the rechunk-copied snapshots have the same tree contents as the old ones
 	for i, snapshotID := range rechunkCopiedSnapshotIDs {
 		restoredir := filepath.Join(env3.base, fmt.Sprintf("restore%d", i))
 		testRunRestore(t, env3.gopts, restoredir, snapshotID.String())
@@ -231,7 +227,7 @@ func TestCopyUnstableJSON(t *testing.T) {
 	testListSnapshots(t, env2.gopts, 1)
 
 	testRunInit(t, env3.gopts)
-	testRunCopy(t, env.gopts, env3.gopts)
+	testRunRechunkCopy(t, env.gopts, env3.gopts)
 	testRunCheck(t, env3.gopts)
 	testListSnapshots(t, env3.gopts, 1)
 }
@@ -245,6 +241,8 @@ func TestCopyToEmptyPassword(t *testing.T) {
 	env2.gopts.InsecureNoPassword = true
 	env3, cleanup3 := withTestEnvironment(t) // test env for rechunk-copy
 	defer cleanup3()
+	env3.gopts.Password = ""
+	env3.gopts.InsecureNoPassword = true
 
 	testSetupBackupData(t, env)
 	testRunBackup(t, "", []string{filepath.Join(env.testdata, "0", "0", "9")}, BackupOptions{}, env.gopts)
