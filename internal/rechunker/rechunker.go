@@ -397,35 +397,3 @@ func HashOfIDs(ids restic.IDs) restic.ID {
 	}
 	return sha256.Sum256(c)
 }
-
-type Cursor struct {
-	blobs   restic.IDs
-	BlobIdx int
-	Offset  uint
-}
-
-func AdvanceCursor(c Cursor, numBytes uint, blobSizes map[restic.ID]uint) (Cursor, error) {
-	for c.BlobIdx < len(c.blobs) {
-		blobSize, ok := blobSizes[c.blobs[c.BlobIdx]]
-		if !ok {
-			return Cursor{}, fmt.Errorf("blob %v not in blobSizes", c.blobs[c.BlobIdx].Str())
-		}
-		r := blobSize - c.Offset
-
-		if numBytes < r {
-			c.Offset += numBytes
-			numBytes = 0
-			break
-		}
-
-		numBytes -= r
-		c.BlobIdx++
-		c.Offset = 0
-	}
-
-	if numBytes != 0 {
-		return Cursor{}, fmt.Errorf("cursor out of range; %d bytes over end position", numBytes)
-	}
-
-	return c, nil
-}
