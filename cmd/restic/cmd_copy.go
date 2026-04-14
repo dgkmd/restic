@@ -87,8 +87,8 @@ type RechunkCopyOptions struct {
 func (opts *RechunkCopyOptions) AddFlags(f *pflag.FlagSet) {
 	f.BoolVar(&opts.Rechunk, "rechunk", false, "rechunk files when copying")
 	f.BoolVar(&opts.ForceRechunk, "force", false, "force rechunk even when src and dst repo have same chunker polynomials; to be used with --rechunk")
-	f.IntVar(&opts.CacheSize, "cache-size", 4096, "for rechunk copy, specify in-memory blob cache size in MiBs (0 to disable cache). Used with --rechunk")
 	f.Var(&opts.AddTags, "add-tag", "add `tags` for the copied snapshots in the format `tag[,tag,...]` (can be specified multiple times). Used with --rechunk")
+	f.IntVar(&opts.CacheSize, "cache-size", 4096, "for rechunk copy, specify in-memory blob cache size in MiBs (0 to disable cache). Used with --rechunk")
 }
 
 // collectAllSnapshots: select all snapshot trees to be copied

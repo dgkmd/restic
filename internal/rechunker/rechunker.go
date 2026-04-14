@@ -352,6 +352,7 @@ func (rc *Rechunker) RewriteTree(ctx context.Context, srcRepo restic.BlobLoader,
 			node.Content = dstBlobs
 			return node
 		},
+		AllowUnstableSerialization: true,
 	})
 
 	newID, err := rewriter.RewriteTree(ctx, srcRepo, saver, "/", treeID)
