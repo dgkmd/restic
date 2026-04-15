@@ -323,7 +323,7 @@ func (rc *Rechunker) RewriteTree(ctx context.Context, srcRepo restic.BlobLoader,
 	}
 
 	// wrap dstRepo so that total uploaded tree blobs size can be tracked
-	saver := wrappedBlobSaver(func(ctx context.Context, tpe restic.BlobType, buf []byte, id restic.ID, storeDuplicate bool) (newID restic.ID, known bool, sizeInRepo int, err error) {
+	treeSaver := wrappedBlobSaver(func(ctx context.Context, tpe restic.BlobType, buf []byte, id restic.ID, storeDuplicate bool) (newID restic.ID, known bool, sizeInRepo int, err error) {
 		newID, known, sizeInRepo, err = dstRepo.SaveBlob(ctx, tpe, buf, id, storeDuplicate)
 		if err != nil {
 			return
@@ -355,14 +355,14 @@ func (rc *Rechunker) RewriteTree(ctx context.Context, srcRepo restic.BlobLoader,
 		AllowUnstableSerialization: true,
 	})
 
-	newID, err := rewriter.RewriteTree(ctx, srcRepo, saver, "/", treeID)
+	newID, err := rewriter.RewriteTree(ctx, srcRepo, treeSaver, "/", treeID)
 	if err != nil {
 		return restic.ID{}, err
 	}
 
 	rc.rewriteTreeMap[treeID] = newID
 
-	return newID, err
+	return newID, nil
 }
 
 func (rc *Rechunker) NumFiles() int {
