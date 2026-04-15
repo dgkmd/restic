@@ -37,12 +37,12 @@ func testRunRechunkCopy(t testing.TB, srcGopts global.Options, dstGopts global.O
 	gopts.InsecureNoPassword = dstGopts.InsecureNoPassword
 	copyOpts := CopyOptions{
 		SecondaryRepoOptions: global.SecondaryRepoOptions{
-			Repo: srcGopts.Repo,
-			Password: srcGopts.Password,
+			Repo:               srcGopts.Repo,
+			Password:           srcGopts.Password,
 			InsecureNoPassword: srcGopts.InsecureNoPassword,
 		},
 		RechunkCopyOptions: RechunkCopyOptions{
-			Rechunk: true,
+			Rechunk:           true,
 			isIntegrationTest: true,
 		},
 	}
@@ -69,7 +69,7 @@ func TestCopy(t *testing.T) {
 
 	testRunInit(t, env2.gopts)
 	testRunCopy(t, env.gopts, env2.gopts)
-	
+
 	testRunInit(t, env3.gopts)
 	testRunRechunkCopy(t, env.gopts, env3.gopts)
 
