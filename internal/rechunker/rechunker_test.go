@@ -63,9 +63,6 @@ func buildRechunkMapByMatchingPath(t *testing.T, srcList, dstList map[string]res
 }
 
 func TestRechunk(t *testing.T) {
-	ctx, cancel := context.WithCancel(t.Context())
-	defer cancel()
-
 	// generate reandom polynomials
 	srcChunkerParam, _ := chunker.RandomPolynomial()
 	dstChunkerParam, _ := chunker.RandomPolynomial()
@@ -91,40 +88,48 @@ func TestRechunk(t *testing.T) {
 		Pol:       dstChunkerParam,
 	})
 
-	err := rechunker.Plan(ctx, srcRepo, restic.IDs{*srcSn.Tree})
-	if err != nil {
-		t.Fatal(err)
-	}
+	t.Run("Plan running", func(t *testing.T) {
+		err := rechunker.Plan(t.Context(), srcRepo, restic.IDs{*srcSn.Tree})
+		if err != nil {
+			t.Fatal(err)
+		}
+	})
 
-	err = rechunker.Rechunk(ctx, srcRepo, dstTestsRepo, nil)
-	if err != nil {
-		t.Fatal(err)
-	}
+	t.Run("Rechunk running", func(t *testing.T) {
+		err := rechunker.Rechunk(t.Context(), srcRepo, dstTestsRepo, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+	})
 
 	// compare dstTestsRepo (rechunker result) vs dstWantsRepo (reference result)
 	// 1) check if all expected data blobs are stored
-	inCtx, stop := context.WithCancelCause(ctx)
-	err = dstWantsRepo.ListBlobs(inCtx, func(pb restic.PackedBlob) {
-		if pb.Type == restic.DataBlob {
-			_, found := dstTestsRepo.LookupBlobSize(restic.DataBlob, pb.ID)
-			if !found {
-				stop(fmt.Errorf("blob %v expected but not found", pb.ID.Str()))
+	t.Run("data blob verification", func(t *testing.T) {
+		inCtx, stop := context.WithCancelCause(t.Context())
+		err := dstWantsRepo.ListBlobs(inCtx, func(pb restic.PackedBlob) {
+			if pb.Type == restic.DataBlob {
+				_, found := dstTestsRepo.LookupBlobSize(restic.DataBlob, pb.ID)
+				if !found {
+					stop(fmt.Errorf("blob %v expected but not found", pb.ID.Str()))
+				}
+			}
+		})
+		if err != nil {
+			t.Error(err)
+		}
+	})
+
+	// 2) check if rechunk is done correctly by comparing rechunkMap
+	t.Run("rechunk mapping verification", func(t *testing.T) {
+		testedRechunkMap := rechunker.rechunkMap
+		for k, v := range wantedRechunkMap {
+			wanted := HashOfIDs(v)
+			tested := HashOfIDs(testedRechunkMap[k])
+			if wanted != tested {
+				t.Errorf("rechunk result for src file %v does not match: %v wanted, but got %v", k.Str(), wanted.Str(), tested.Str())
 			}
 		}
 	})
-	if err != nil {
-		t.Error(err)
-	}
-
-	// 2) check if rechunk is done correctly by comparing rechunkMap
-	testedRechunkMap := rechunker.rechunkMap
-	for k, v := range wantedRechunkMap {
-		wanted := HashOfIDs(v)
-		tested := HashOfIDs(testedRechunkMap[k])
-		if wanted != tested {
-			t.Errorf("rechunk result for src file %v does not match: %v wanted, but got %v", k.Str(), wanted.Str(), tested.Str())
-		}
-	}
 }
 
 type BlobIDsPair struct {
@@ -223,11 +228,19 @@ func TestRechunkerRewriteTree(t *testing.T) {
 	testsRepo := data.TestWritableTreeMap{TestTreeMap: data.TestTreeMap{}}
 	rechunker := NewRechunker(Config{})
 	rechunker.rechunkMap = rechunkMap
-	testsRoot, err := rechunker.RewriteTree(t.Context(), srcRepo, testsRepo, srcRoot)
-	if err != nil {
-		t.Error(err)
-	}
-	if wantsRoot != testsRoot {
-		t.Errorf("tree mismatch. wants: %v, tests: %v", wantsRoot, testsRoot)
-	}
+
+	var testsRoot restic.ID
+	t.Run("RewriteTree running", func(t *testing.T) {
+		root, err := rechunker.RewriteTree(t.Context(), srcRepo, testsRepo, srcRoot)
+		if err != nil {
+			t.Error(err)
+		}
+		testsRoot = root
+	})
+
+	t.Run("result verification", func(t *testing.T) {
+		if wantsRoot != testsRoot {
+			t.Errorf("tree mismatch. wants: %v, tests: %v", wantsRoot, testsRoot)
+		}
+	})
 }
