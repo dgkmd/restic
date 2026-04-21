@@ -17,25 +17,36 @@ import (
 // prepareData prepares random data for rechunker test.
 func prepareData(t *testing.T) string {
 	tempdir := rtest.TempDir(t)
+	data := map[int][]byte{
+		1: rtest.Random(1, 10_000),
+		2: rtest.Random(2, 10_000_000),
+		3: rtest.Random(3, 100_000_000),
+	}
 	repo := archiver.TestDir{
-		"0": archiver.TestFile{Content: ""},
-		"1": archiver.TestFile{Content: string(rtest.Random(1, 10_000))},
-		"2": archiver.TestFile{Content: string(rtest.Random(4, 10_000_000))},
-		"3": archiver.TestFile{Content: string(rtest.Random(5, 100_000_000))},
+		"zero":  archiver.TestFile{Content: ""},
+		"one":   archiver.TestFile{Content: string(data[1])},
+		"two":   archiver.TestFile{Content: string(data[2])},
+		"three": archiver.TestFile{Content: string(data[3])},
+		"dir1": archiver.TestDir{
+			"dir2": archiver.TestDir{
+				"dup_1": archiver.TestFile{Content: string(data[1])},
+				"dup_3": archiver.TestFile{Content: string(data[3])},
+			},
+		},
 	}
 	archiver.TestCreateFiles(t, tempdir, repo)
 
 	return tempdir
 }
 
-func gatherFileContentsByPath(t *testing.T, repo restic.BlobLoader, root restic.ID) map[string]restic.IDs {
+func gatherNodesByPath(t *testing.T, repo restic.BlobLoader, root restic.ID) map[string]*data.Node {
 	t.Helper()
 
-	record := map[string]restic.IDs{}
+	result := map[string]*data.Node{}
 	err := walker.Walk(t.Context(), repo, root, walker.WalkVisitor{
 		ProcessNode: func(parentTreeID restic.ID, path string, node *data.Node, nodeErr error) (err error) {
-			if node != nil && node.Type == data.NodeTypeFile {
-				record[path] = node.Content
+			if node != nil {
+				result[path] = node
 			}
 			return nodeErr
 		},
@@ -44,25 +55,28 @@ func gatherFileContentsByPath(t *testing.T, repo restic.BlobLoader, root restic.
 		t.Fatal(err)
 	}
 
-	return record
+	return result
 }
 
-func buildRechunkMapByMatchingPath(t *testing.T, srcList, dstList map[string]restic.IDs) map[restic.ID]restic.IDs {
+func buildRechunkMapByMatchingPath(t *testing.T, srcNodes, dstNodes map[string]*data.Node) map[restic.ID]restic.IDs {
 	t.Helper()
 
 	rechunkMap := map[restic.ID]restic.IDs{}
 
-	for k, v := range srcList {
-		if _, ok := dstList[k]; !ok {
-			t.Fatalf("%v expected in dstList, but not found", k)
+	for k, v := range srcNodes {
+		if v.Type != data.NodeTypeFile {
+			continue
 		}
-		rechunkMap[HashOfIDs(v)] = dstList[k]
+		if _, ok := dstNodes[k]; !ok {
+			t.Fatalf("%v expected in dstNodes, but not found", k)
+		}
+		rechunkMap[HashOfIDs(v.Content)] = dstNodes[k].Content
 	}
 
 	return rechunkMap
 }
 
-func TestRechunk(t *testing.T) {
+func TestRechunker(t *testing.T) {
 	// generate reandom polynomials
 	srcChunkerParam, _ := chunker.RandomPolynomial()
 	dstChunkerParam, _ := chunker.RandomPolynomial()
@@ -78,9 +92,9 @@ func TestRechunk(t *testing.T) {
 	srcSn := archiver.TestSnapshot(t, srcRepo, tempdir, nil)
 	dstWantsSn := archiver.TestSnapshot(t, dstWantsRepo, tempdir, nil)
 
-	srcList := gatherFileContentsByPath(t, srcRepo, *srcSn.Tree)
-	dstWantsList := gatherFileContentsByPath(t, dstWantsRepo, *dstWantsSn.Tree)
-	wantedRechunkMap := buildRechunkMapByMatchingPath(t, srcList, dstWantsList)
+	srcNodes := gatherNodesByPath(t, srcRepo, *srcSn.Tree)
+	dstWantsNodes := gatherNodesByPath(t, dstWantsRepo, *dstWantsSn.Tree)
+	wantedRechunkMap := buildRechunkMapByMatchingPath(t, srcNodes, dstWantsNodes)
 
 	// run rechunk copy
 	rechunker := NewRechunker(Config{
@@ -100,6 +114,15 @@ func TestRechunk(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
+	})
+
+	var testsTree restic.ID
+	t.Run("RewriteTrees running", func(t *testing.T) {
+		newID, err := rechunker.RewriteTrees(t.Context(), srcRepo, dstTestsRepo, restic.IDs{*srcSn.Tree})
+		if err != nil {
+			t.Fatal(err)
+		}
+		testsTree = newID[0]
 	})
 
 	// compare dstTestsRepo (rechunker result) vs dstWantsRepo (reference result)
@@ -123,124 +146,48 @@ func TestRechunk(t *testing.T) {
 	t.Run("rechunk mapping verification", func(t *testing.T) {
 		testedRechunkMap := rechunker.rechunkMap
 		for k, v := range wantedRechunkMap {
-			wanted := HashOfIDs(v)
-			tested := HashOfIDs(testedRechunkMap[k])
-			if wanted != tested {
-				t.Errorf("rechunk result for src file %v does not match: %v wanted, but got %v", k.Str(), wanted.Str(), tested.Str())
+			wants := HashOfIDs(v)
+			tests := HashOfIDs(testedRechunkMap[k])
+			if wants != tests {
+				t.Errorf("rechunk result for src file %v does not match: %v expected, but got %v", k.Str(), wants.Str(), tests.Str())
 			}
 		}
 	})
-}
 
-type BlobIDsPair struct {
-	srcBlobIDs restic.IDs
-	dstBlobIDs restic.IDs
-}
+	// 3) check if tree is rewritten correctly by comparing tree nodes
+	t.Run("tree verification", func(t *testing.T) {
+		testsNodes := gatherNodesByPath(t, dstTestsRepo, testsTree)
 
-func generateRandomBlobIDsPair(nSrc, nDst uint) BlobIDsPair {
-	srcIDs := make(restic.IDs, 0, nSrc)
-	dstIDs := make(restic.IDs, 0, nDst)
-	for range nSrc {
-		srcIDs = append(srcIDs, restic.NewRandomID())
-	}
-	for range nDst {
-		dstIDs = append(dstIDs, restic.NewRandomID())
-	}
-
-	return BlobIDsPair{srcBlobIDs: srcIDs, dstBlobIDs: dstIDs}
-}
-
-// prepareTree prepares sample tree for rewriteTree test.
-func prepareTree() (srcTree walker.TestTree, wantsTree walker.TestTree, rechunkMap map[restic.ID]restic.IDs) {
-	blobIDsMap := map[string]BlobIDsPair{
-		"a":        generateRandomBlobIDsPair(1, 1),
-		"subdir/a": generateRandomBlobIDsPair(30, 31),
-		"x":        generateRandomBlobIDsPair(42, 41),
-		"0":        generateRandomBlobIDsPair(0, 0),
-	}
-	rechunkMap = map[restic.ID]restic.IDs{}
-	for _, v := range blobIDsMap {
-		rechunkMap[HashOfIDs(v.srcBlobIDs)] = v.dstBlobIDs
-	}
-
-	srcTree = walker.TestTree{
-		"zerofile": walker.TestFile{
-			Size:    0,
-			Content: restic.IDs{},
-		},
-		"a": walker.TestFile{
-			Size:    1,
-			Content: blobIDsMap["a"].srcBlobIDs,
-		},
-		"x": walker.TestFile{
-			Size:    2,
-			Content: blobIDsMap["x"].srcBlobIDs,
-		},
-		"subdir": walker.TestTree{
-			"a": walker.TestFile{
-				Size:    3,
-				Content: blobIDsMap["subdir/a"].srcBlobIDs,
-			},
-			"subdir": walker.TestTree{
-				"dup_x": walker.TestFile{
-					Size:    2,
-					Content: blobIDsMap["x"].srcBlobIDs,
-				},
-			},
-		},
-	}
-	wantsTree = walker.TestTree{
-		"zerofile": walker.TestFile{
-			Size:    0,
-			Content: restic.IDs{},
-		},
-		"a": walker.TestFile{
-			Size:    1,
-			Content: blobIDsMap["a"].dstBlobIDs,
-		},
-		"x": walker.TestFile{
-			Size:    2,
-			Content: blobIDsMap["x"].dstBlobIDs,
-		},
-		"subdir": walker.TestTree{
-			"a": walker.TestFile{
-				Size:    3,
-				Content: blobIDsMap["subdir/a"].dstBlobIDs,
-			},
-			"subdir": walker.TestTree{
-				"dup_x": walker.TestFile{
-					Size:    2,
-					Content: blobIDsMap["x"].dstBlobIDs,
-				},
-			},
-		},
-	}
-
-	return srcTree, wantsTree, rechunkMap
-}
-
-func TestRechunkerRewriteTree(t *testing.T) {
-	srcTree, wantsTree, rechunkMap := prepareTree()
-
-	srcRepo, srcRoot := walker.BuildTreeMap(srcTree)
-	_, wantsRoot := walker.BuildTreeMap(wantsTree)
-
-	testsRepo := data.TestWritableTreeMap{TestTreeMap: data.TestTreeMap{}}
-	rechunker := NewRechunker(Config{})
-	rechunker.rechunkMap = rechunkMap
-
-	var testsRoot restic.ID
-	t.Run("RewriteTree running", func(t *testing.T) {
-		root, err := rechunker.RewriteTree(t.Context(), srcRepo, testsRepo, srcRoot)
-		if err != nil {
-			t.Error(err)
+		// (i) compare Content field with dstWantsNodes
+		for path, node := range dstWantsNodes {
+			if node.Type != data.NodeTypeFile {
+				continue
+			}
+			if _, ok := testsNodes[path]; !ok {
+				t.Errorf("node for path %v does not exist", path)
+				continue
+			}
+			wants := HashOfIDs(node.Content)
+			tests := HashOfIDs(testsNodes[path].Content)
+			if wants != tests {
+				t.Errorf("node content for path %v does not match: %v expected, but got %v", path, wants.Str(), tests.Str())
+			}
 		}
-		testsRoot = root
-	})
 
-	t.Run("result verification", func(t *testing.T) {
-		if wantsRoot != testsRoot {
-			t.Errorf("tree mismatch. wants: %v, tests: %v", wantsRoot, testsRoot)
+		// (ii) compare remaining fields with srcNodes
+		for path, wantsNode := range srcNodes {
+			testsNode, ok := testsNodes[path]
+			if !ok {
+				t.Errorf("node for path %v does not exist", path)
+				continue
+			}
+			// copy nodes and clear rewritten fields for comparison
+			wants, tests := *wantsNode, *testsNode
+			wants.Content, tests.Content = nil, nil
+			wants.Subtree, tests.Subtree = nil, nil
+			if !wants.Equals(tests) {
+				t.Errorf("node fields for path %v does not match", path)
+			}
 		}
 	})
 }
