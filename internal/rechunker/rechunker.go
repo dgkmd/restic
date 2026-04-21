@@ -64,22 +64,9 @@ func (rc *Rechunker) reset() {
 }
 
 func (rc *Rechunker) Plan(ctx context.Context, srcRepo restic.Repository, rootTrees restic.IDs) error {
-	rc.reset()
-
-	visitedFiles := restic.IDSet{}
-	visitedTrees := restic.IDSet{}
-
-	// skip previously processed files and trees
-	for k := range rc.rechunkMap {
-		visitedFiles.Insert(k)
-	}
-	for k := range rc.rewriteTreeMap {
-		visitedTrees.Insert(k)
-	}
-
 	var err error
 	debug.Log("Gathering distinct file Contents from target snapshots")
-	rc.filesList, rc.totalSize, err = gatherFileContents(ctx, srcRepo, rootTrees, visitedFiles, visitedTrees)
+	rc.filesList, rc.totalSize, err = gatherFileContents(ctx, srcRepo, rootTrees)
 	if err != nil {
 		return err
 	}
@@ -100,8 +87,10 @@ func (rc *Rechunker) Plan(ctx context.Context, srcRepo restic.Repository, rootTr
 	return nil
 }
 
-func gatherFileContents(ctx context.Context, repo restic.Loader, rootTrees restic.IDs, visitedFiles restic.IDSet, visitedTrees restic.IDSet) (filesList []*ChunkedFile, totalSize uint64, err error) {
+func gatherFileContents(ctx context.Context, repo restic.Loader, rootTrees restic.IDs) (filesList []*ChunkedFile, totalSize uint64, err error) {
 	mu := sync.Mutex{}
+	visitedFiles := restic.NewIDSet()
+	visitedTrees := restic.NewIDSet()
 
 	// Stream through all subtrees in target rootTrees and gather all distinct file Contents
 	err = data.StreamTrees(ctx, repo, rootTrees, nil, func(id restic.ID) bool {
@@ -186,13 +175,11 @@ func createIndex(filesList []*ChunkedFile, lookupBlob func(t restic.BlobType, id
 	return idx, nil
 }
 
-type Loader interface {
-	restic.BlobLoader
-	LoadBlobsFromPack(context.Context, restic.ID, []restic.Blob, func(restic.BlobHandle, []byte, error) error) error
-	Connections() uint
-}
+func (rc *Rechunker) Rechunk(ctx context.Context, srcRepo, dstRepo restic.Repository, p *Progress) error {
+	if dstRepo.Config().ChunkerPolynomial != rc.cfg.Pol {
+		return fmt.Errorf("chunker polynomial of dstRepo does not match with Rechunker's one")
+	}
 
-func (rc *Rechunker) Rechunk(ctx context.Context, srcRepo Loader, dstRepo restic.WithBlobUploader, p *Progress) error {
 	if !rc.rechunkReady {
 		return fmt.Errorf("Plan() must be run first before Rechunk()")
 	}
