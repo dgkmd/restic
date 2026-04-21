@@ -419,7 +419,7 @@ func rechunkCopy(ctx context.Context, srcRepo, dstRepo restic.Repository, select
 	printer.V("  - Total size (including duplicate blobs): %v", ui.FormatBytes(rechnker.TotalSize()))
 	printer.V("Number of packs to download: %v\n\n", rechnker.PackCount())
 
-	debug.Log("Running RechunkData()")
+	debug.Log("Running Rechunk()")
 	progress.Start(rechnker.NumFiles(), rechnker.TotalSize())
 	err = rechnker.Rechunk(ctx, srcRepo, dstRepo, progress)
 	if err != nil {
@@ -427,24 +427,14 @@ func rechunkCopy(ctx context.Context, srcRepo, dstRepo restic.Repository, select
 	}
 	progress.Done()
 
-	printer.V("\nRewriting trees...")
-	err = dstRepo.WithBlobUploader(ctx, func(ctx context.Context, uploader restic.BlobSaverWithAsync) error {
-		for _, tree := range rootTrees {
-			debug.Log("Running RewriteTree() for tree ID %v", tree.Str())
-			_, err := rechnker.RewriteTree(ctx, srcRepo, uploader, tree)
-			if err != nil {
-				return err
-			}
-		}
-
-		return nil
-	})
+	printer.V("Rewriting trees...")
+	debug.Log("Running RewriteTrees()")
+	_, err = rechnker.RewriteTrees(ctx, srcRepo, dstRepo, rootTrees)
 	if err != nil {
 		return err
 	}
-	printer.V("Rewriting done.\n\n")
 
-	printer.V("Writing snapshots")
+	printer.V("Writing snapshots...")
 	for _, sn := range snapshots {
 		newTreeID, err := rechnker.GetRewrittenTree(*sn.Tree)
 		if err != nil {

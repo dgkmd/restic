@@ -56,13 +56,6 @@ func NewRechunker(cfg Config) *Rechunker {
 	}
 }
 
-func (rc *Rechunker) reset() {
-	rc.idx = nil
-
-	rc.filesList = nil
-	rc.rechunkReady = false
-}
-
 func (rc *Rechunker) Plan(ctx context.Context, srcRepo restic.Repository, rootTrees restic.IDs) error {
 	var err error
 	debug.Log("Gathering distinct file Contents from target snapshots")
@@ -302,26 +295,9 @@ func (s wrappedBlobSaver) SaveBlob(ctx context.Context, tpe restic.BlobType, buf
 	return s(ctx, tpe, buf, id, storeDuplicate)
 }
 
-func (rc *Rechunker) RewriteTree(ctx context.Context, srcRepo restic.BlobLoader, dstRepo restic.BlobSaver, treeID restic.ID) (restic.ID, error) {
-	// check if the identical tree has already been processed
-	newID, ok := rc.rewriteTreeMap[treeID]
-	if ok {
-		return newID, nil
-	}
+func (rc *Rechunker) RewriteTrees(ctx context.Context, srcRepo, dstRepo restic.Repository, treeIDs restic.IDs) (restic.IDs, error) {
+	result := restic.IDs{}
 
-	// wrap dstRepo so that total uploaded tree blobs size can be tracked
-	treeSaver := wrappedBlobSaver(func(ctx context.Context, tpe restic.BlobType, buf []byte, id restic.ID, storeDuplicate bool) (newID restic.ID, known bool, sizeInRepo int, err error) {
-		newID, known, sizeInRepo, err = dstRepo.SaveBlob(ctx, tpe, buf, id, storeDuplicate)
-		if err != nil {
-			return
-		}
-		if !known {
-			rc.totalAddedToDstRepo.Add(uint64(sizeInRepo))
-		}
-		return
-	})
-
-	// prepare rewriter that rewrites node.Content of regular files
 	rewriter := walker.NewTreeRewriter(walker.RewriteOpts{
 		RewriteNode: func(node *data.Node, _ string) *data.Node {
 			if node == nil {
@@ -342,14 +318,42 @@ func (rc *Rechunker) RewriteTree(ctx context.Context, srcRepo restic.BlobLoader,
 		AllowUnstableSerialization: true,
 	})
 
-	newID, err := rewriter.RewriteTree(ctx, srcRepo, treeSaver, "/", treeID)
+	err := dstRepo.WithBlobUploader(ctx, func(ctx context.Context, uploader restic.BlobSaverWithAsync) error {
+		// wrap dstRepo so that total uploaded tree blobs size can be tracked
+		saver := wrappedBlobSaver(func(ctx context.Context, tpe restic.BlobType, buf []byte, id restic.ID, storeDuplicate bool) (newID restic.ID, known bool, sizeInRepo int, err error) {
+			newID, known, sizeInRepo, err = uploader.SaveBlob(ctx, tpe, buf, id, storeDuplicate)
+			if err != nil {
+				return
+			}
+			if !known {
+				rc.totalAddedToDstRepo.Add(uint64(sizeInRepo))
+			}
+			return
+		})
+
+		for _, treeID := range treeIDs {
+			// check if the identical tree has already been processed
+			newID, ok := rc.rewriteTreeMap[treeID]
+			if ok {
+				result = append(result, newID)
+				continue
+			}
+
+			newID, err := rewriter.RewriteTree(ctx, srcRepo, saver, "/", treeID)
+			if err != nil {
+				return err
+			}
+			rc.rewriteTreeMap[treeID] = newID
+			result = append(result, newID)
+		}
+
+		return nil
+	})
 	if err != nil {
-		return restic.ID{}, err
+		return nil, err
 	}
 
-	rc.rewriteTreeMap[treeID] = newID
-
-	return newID, nil
+	return result, nil
 }
 
 func (rc *Rechunker) NumFiles() int {
