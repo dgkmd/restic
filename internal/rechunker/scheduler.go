@@ -21,12 +21,12 @@ type Scheduler struct {
 	regularList  []*ChunkedFile
 	priorityList []*ChunkedFile
 
-	filesContaining map[restic.ID][]*ChunkedFile
-	blobsToPrepare  map[restic.ID]int
+	prefixLookup         map[restic.ID][]*ChunkedFile // blob ID -> files that contain the blob as prefix
+	remainingPrefixBlobs map[restic.ID]int            // file hashval -> remaining count until all its blobs ready
 
-	remainingBlobNeeds map[restic.ID]int
+	remainingBlobUsage map[restic.ID]int // blob ID -> remaining blob usage until the end
 
-	obsoleteBlobCB func(ids restic.IDs)
+	ignoreBlobsCB func(ids restic.IDs)
 
 	push chan struct{}
 	done chan struct{}
@@ -40,25 +40,25 @@ func NewScheduler(ctx context.Context, files []*ChunkedFile, idx Index, usePrior
 
 	if !usePriority {
 		s := &Scheduler{
-			idx:                idx,
-			regularList:        files,
-			done:               make(chan struct{}),
-			filesContaining:    filesContaining,
-			blobsToPrepare:     blobsToPrepare,
-			remainingBlobNeeds: remainingBlobNeeds,
+			idx:                  idx,
+			regularList:          files,
+			done:                 make(chan struct{}),
+			prefixLookup:         filesContaining,
+			remainingPrefixBlobs: blobsToPrepare,
+			remainingBlobUsage:   remainingBlobNeeds,
 		}
 		s.createRegularCh(ctx, wg, nil)
 		return s
 	}
 
 	s := &Scheduler{
-		idx:                idx,
-		regularList:        files,
-		push:               make(chan struct{}, 1),
-		done:               make(chan struct{}),
-		filesContaining:    filesContaining,
-		blobsToPrepare:     blobsToPrepare,
-		remainingBlobNeeds: remainingBlobNeeds,
+		idx:                  idx,
+		regularList:          files,
+		push:                 make(chan struct{}, 1),
+		done:                 make(chan struct{}),
+		prefixLookup:         filesContaining,
+		remainingPrefixBlobs: blobsToPrepare,
+		remainingBlobUsage:   remainingBlobNeeds,
 	}
 
 	set := restic.IDSet{}
@@ -82,23 +82,23 @@ func NewScheduler(ctx context.Context, files []*ChunkedFile, idx Index, usePrior
 const FILE_HEAD_LENGTH = 25
 
 func createSchedulerState(files []*ChunkedFile) (map[restic.ID][]*ChunkedFile, map[restic.ID]int, map[restic.ID]int) {
-	blobCount := map[restic.ID]int{}
-	filesContaining := map[restic.ID][]*ChunkedFile{}
-	blobsToPrepare := map[restic.ID]int{}
+	blobUsage := map[restic.ID]int{}
+	prefixLookup := map[restic.ID][]*ChunkedFile{}
+	numPrefixBlobs := map[restic.ID]int{}
 
 	for _, file := range files {
 		prefixLen := min(FILE_HEAD_LENGTH, len(file.IDs))
-		blobSet := restic.NewIDSet(file.IDs[:prefixLen]...)
-		blobsToPrepare[file.hashval] = len(blobSet)
+		prefixSet := restic.NewIDSet(file.IDs[:prefixLen]...)
+		numPrefixBlobs[file.hashval] = len(prefixSet)
 		for _, blob := range file.IDs {
-			blobCount[blob]++
+			blobUsage[blob]++
 		}
-		for b := range blobSet {
-			filesContaining[b] = append(filesContaining[b], file)
+		for b := range prefixSet {
+			prefixLookup[b] = append(prefixLookup[b], file)
 		}
 	}
 
-	return filesContaining, blobsToPrepare, blobCount
+	return prefixLookup, numPrefixBlobs, blobUsage
 }
 
 func (s *Scheduler) Next(ctx context.Context) (*ChunkedFile, bool, error) {
@@ -114,7 +114,7 @@ func (s *Scheduler) NextPriority(ctx context.Context) (*ChunkedFile, bool, error
 	return file, from != 0, err
 }
 
-func (s *Scheduler) PushPriority(files []*ChunkedFile) {
+func (s *Scheduler) pushPriority(files []*ChunkedFile) {
 	if s.priorityCh == nil {
 		return
 	}
@@ -221,14 +221,14 @@ func (s *Scheduler) BlobReady(ids restic.IDs) {
 
 	s.mu.Lock()
 	for _, id := range ids {
-		for _, file := range s.filesContaining[id] {
-			n := s.blobsToPrepare[file.hashval]
+		for _, file := range s.prefixLookup[id] {
+			n := s.remainingPrefixBlobs[file.hashval]
 			if n > 0 {
 				n--
 				if n == 0 {
 					readyFiles = append(readyFiles, file)
 				}
-				s.blobsToPrepare[file.hashval] = n
+				s.remainingPrefixBlobs[file.hashval] = n
 			}
 		}
 	}
@@ -238,7 +238,7 @@ func (s *Scheduler) BlobReady(ids restic.IDs) {
 		return
 	}
 
-	s.PushPriority(readyFiles)
+	s.pushPriority(readyFiles)
 
 	if debugStats != nil {
 		dAdds := map[string]int{}
@@ -261,22 +261,22 @@ func (s *Scheduler) BlobUnready(ids restic.IDs) {
 
 	s.mu.Lock()
 	for _, id := range ids {
-		filesToUpdate := s.filesContaining[id]
+		filesToUpdate := s.prefixLookup[id]
 		for _, file := range filesToUpdate {
 			// files with blobsToPrepare==0 is not tracked
-			if s.blobsToPrepare[file.hashval] > 0 {
-				s.blobsToPrepare[file.hashval]++
+			if s.remainingPrefixBlobs[file.hashval] > 0 {
+				s.remainingPrefixBlobs[file.hashval]++
 			}
 		}
 	}
 	s.mu.Unlock()
 }
 
-func (s *Scheduler) SetObsoleteBlobCallback(cb func(restic.IDs)) {
+func (s *Scheduler) SetIgnoreBlobsCallback(cb func(restic.IDs)) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	s.obsoleteBlobCB = cb
+	s.ignoreBlobsCB = cb
 }
 
 func (s *Scheduler) newCursor(blobs restic.IDs) cursor {
@@ -290,16 +290,12 @@ func (s *Scheduler) newCursor(blobs restic.IDs) cursor {
 	}
 }
 
-// progressCursor computes progress of cursor for a file, while inferring src blob consumption and using that info to track blob usage.
-func (s *Scheduler) progressCursor(c cursor, bytesProcessed uint) (cursor, error) {
+// updateCursor computes progress of cursor for a file, while inferring src blob consumption and using that info to track blob usage.
+func (s *Scheduler) updateCursor(c cursor, bytesProcessed uint) (cursor, error) {
 	start := c
 	end, err := c.Advance(bytesProcessed)
 	if err != nil {
 		return cursor{}, err
-	}
-
-	if s.obsoleteBlobCB == nil {
-		return end, nil
 	}
 
 	if start.BlobIdx == end.BlobIdx {
@@ -310,8 +306,8 @@ func (s *Scheduler) progressCursor(c cursor, bytesProcessed uint) (cursor, error
 	var obsolete restic.IDs
 	s.mu.Lock()
 	for _, b := range blobs {
-		s.remainingBlobNeeds[b]--
-		if s.remainingBlobNeeds[b] == 0 {
+		s.remainingBlobUsage[b]--
+		if s.remainingBlobUsage[b] == 0 {
 			obsolete = append(obsolete, b)
 		}
 	}
@@ -321,7 +317,9 @@ func (s *Scheduler) progressCursor(c cursor, bytesProcessed uint) (cursor, error
 		return end, nil
 	}
 
-	s.obsoleteBlobCB(obsolete)
+	if s.ignoreBlobsCB != nil {
+		s.ignoreBlobsCB(obsolete)
+	}
 
 	return end, nil
 }

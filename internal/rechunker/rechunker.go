@@ -42,10 +42,10 @@ type ChunkedFile struct {
 }
 
 type Index interface {
-	BlobSize(blobID restic.ID) (size uint)
-	BlobToPack(blobID restic.ID) (packID restic.ID)
-	PackToBlobs(packID restic.ID) (blobs []restic.Blob)
-	Packs() (packIDs restic.IDSet)
+	BlobSize(blobID restic.ID) (size uint)              // blob ID -> blob size
+	BlobToPack(blobID restic.ID) (packID restic.ID)     // blob ID -> pack ID
+	PackToBlobs(packID restic.ID) (blobs []restic.Blob) // pack ID -> list of blobs to be loaded from the pack
+	Packs() (packIDs restic.IDSet)                      // set of all pack IDs
 }
 
 func NewRechunker(cfg Config) *Rechunker {
@@ -230,9 +230,20 @@ func (rc *Rechunker) Rechunk(ctx context.Context, srcRepo, dstRepo restic.Reposi
 		debug.Log("Starting uploader")
 		defer debug.Log("Closing uploader")
 
+		workerCfg := WorkerConfig{
+			Pol: rc.cfg.Pol,
+
+			Downloader: downloader,
+			Uploader:   uploader,
+			BufferPool: bufferPool,
+
+			NewCursor:    scheduler.newCursor,
+			UpdateCursor: scheduler.updateCursor,
+		}
+
 		wg, ctx := errgroup.WithContext(ctx)
-		rc.runWorkers(ctx, wg, numWorkers, downloader, uploader, scheduler.Next, scheduler.progressCursor, bufferPool, p)
-		rc.runWorkers(ctx, wg, 1, downloader, uploader, scheduler.NextPriority, scheduler.progressCursor, bufferPool, p)
+		rc.runWorkers(ctx, wg, numWorkers, workerCfg, scheduler.Next, p)
+		rc.runWorkers(ctx, wg, 1, workerCfg, scheduler.NextPriority, p)
 
 		return wg.Wait()
 	})
@@ -266,24 +277,18 @@ func (rc *Rechunker) setupCache(ctx context.Context, srcRepo PackLoader, schedul
 	repo, cache = WrapWithCache(ctx, srcRepo, rc.cfg.CacheSize, numDownloaders, rc.idx, scheduler.BlobReady, scheduler.BlobUnready)
 
 	// register cache.Ignore as scheduler's obsolete blob callback for early cache eviction
-	scheduler.SetObsoleteBlobCallback(cache.Ignore)
+	scheduler.SetIgnoreBlobsCallback(cache.Ignore)
 
 	return repo, cache
 }
 
 func (rc *Rechunker) runWorkers(ctx context.Context, wg *errgroup.Group, numWorkers int,
-	downloader restic.BlobLoader, uploader restic.BlobSaver, receiveJob func(context.Context) (*ChunkedFile, bool, error),
-	cursorProgressor func(cursor, uint) (cursor, error), bufferPool *BufferPool, p *Progress) {
+	workerCfg WorkerConfig, receiveJob func(context.Context) (*ChunkedFile, bool, error),
+	p *Progress) {
 	for range numWorkers {
 		wg.Go(func() error {
 			debug.Log("Starting worker")
-			worker := NewWorker(
-				rc.cfg.Pol,
-				downloader,
-				uploader,
-				bufferPool,
-				cursorProgressor,
-			)
+			worker := NewWorker(workerCfg)
 
 			for {
 				debug.Log("receiving job")

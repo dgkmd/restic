@@ -22,22 +22,34 @@ type Worker struct {
 	downloader restic.BlobLoader
 	uploader   restic.BlobSaver
 
-	cursorProgressor func(cursor cursor, bytesProcessed uint) (cursor, error)
+	newCursor    func(blobs restic.IDs) cursor
+	updateCursor func(c cursor, numBytes uint) (cursor, error)
+}
+type WorkerConfig struct {
+	Pol chunker.Pol
+
+	Downloader restic.BlobLoader
+	Uploader   restic.BlobSaver
+	BufferPool *BufferPool
+
+	NewCursor    func(blobs restic.IDs) cursor
+	UpdateCursor func(c cursor, numBytes uint) (cursor, error)
 }
 
-func NewWorker(pol chunker.Pol, downloader restic.BlobLoader, uploader restic.BlobSaver,
-	bufferPool *BufferPool,
-	cursorProgressor func(cursor, uint) (cursor, error),
-) *Worker {
+func NewWorker(cfg WorkerConfig) *Worker {
+	if cfg.BufferPool == nil {
+		cfg.BufferPool = NewBufferPool(3)
+	}
 	return &Worker{
-		pool: bufferPool,
+		pool: cfg.BufferPool,
 
-		chunker:    chunker.New(nil, pol),
-		pol:        pol,
-		downloader: downloader,
-		uploader:   uploader,
+		chunker:    chunker.New(nil, cfg.Pol),
+		pol:        cfg.Pol,
+		downloader: cfg.Downloader,
+		uploader:   cfg.Uploader,
 
-		cursorProgressor: cursorProgressor,
+		newCursor:    cfg.NewCursor,
+		updateCursor: cfg.UpdateCursor,
 	}
 }
 
@@ -77,7 +89,10 @@ func (w *Worker) runReader(ctx context.Context, wg *errgroup.Group, srcBlobs res
 
 		w.chunker.Reset(reader, w.pol)
 
-		c := cursor{blobs: srcBlobs}
+		var c cursor
+		if w.newCursor != nil {
+			c = w.newCursor(srcBlobs)
+		}
 
 		for {
 			// bring buffer from bufferPool
@@ -93,9 +108,8 @@ func (w *Worker) runReader(ctx context.Context, wg *errgroup.Group, srcBlobs res
 				return err
 			}
 
-			// if cursor progressor callback is given, run it
-			if w.cursorProgressor != nil {
-				c, err = w.cursorProgressor(c, chunk.Length)
+			if w.updateCursor != nil {
+				c, err = w.updateCursor(c, chunk.Length)
 				if err != nil {
 					return err
 				}
