@@ -417,7 +417,7 @@ func rechunkCopy(ctx context.Context, srcRepo, dstRepo restic.Repository, select
 	printer.V("Number of snapshots: %v", len(rootTrees))
 	printer.V("Number of distinct files to process: %v", rechnker.NumFiles())
 	printer.V("  - Total size (including duplicate blobs): %v", ui.FormatBytes(rechnker.TotalSize()))
-	printer.V("Number of packs to download: %v\n\n", rechnker.PackCount())
+	printer.V("Number of packs to download: %v\n\n", rechnker.NumPacks())
 
 	debug.Log("Running Rechunk()")
 	progress.Start(rechnker.NumFiles(), rechnker.TotalSize())

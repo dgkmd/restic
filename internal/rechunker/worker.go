@@ -2,7 +2,6 @@ package rechunker
 
 import (
 	"context"
-	"fmt"
 	"io"
 
 	"github.com/restic/chunker"
@@ -23,12 +22,12 @@ type Worker struct {
 	downloader restic.BlobLoader
 	uploader   restic.BlobSaver
 
-	cursorProgressor func(cursor Cursor, bytesProcessed uint) (Cursor, error)
+	cursorProgressor func(cursor cursor, bytesProcessed uint) (cursor, error)
 }
 
 func NewWorker(pol chunker.Pol, downloader restic.BlobLoader, uploader restic.BlobSaver,
 	bufferPool *BufferPool,
-	cursorProgressor func(Cursor, uint) (Cursor, error),
+	cursorProgressor func(cursor, uint) (cursor, error),
 ) *Worker {
 	return &Worker{
 		pool: bufferPool,
@@ -78,14 +77,14 @@ func (w *Worker) runReader(ctx context.Context, wg *errgroup.Group, srcBlobs res
 
 		w.chunker.Reset(reader, w.pol)
 
-		cursor := Cursor{blobs: srcBlobs}
+		c := cursor{blobs: srcBlobs}
 
 		for {
 			// bring buffer from bufferPool
 			buf := w.pool.Get()
 
 			// rechunk with new parameter
-			c, err := w.chunker.Next(buf)
+			chunk, err := w.chunker.Next(buf)
 			if err == io.EOF { // reached EOF; all done
 				w.pool.Put(buf)
 				return nil
@@ -96,7 +95,7 @@ func (w *Worker) runReader(ctx context.Context, wg *errgroup.Group, srcBlobs res
 
 			// if cursor progressor callback is given, run it
 			if w.cursorProgressor != nil {
-				cursor, err = w.cursorProgressor(cursor, c.Length)
+				c, err = w.cursorProgressor(c, chunk.Length)
 				if err != nil {
 					return err
 				}
@@ -106,8 +105,8 @@ func (w *Worker) runReader(ctx context.Context, wg *errgroup.Group, srcBlobs res
 			select {
 			case <-ctx.Done():
 				return ctx.Err()
-			case out <- c:
-				debug.Log("Sending a new chunk of size %v to writer", c.Length)
+			case out <- chunk:
+				debug.Log("Sending a new chunk of size %v to writer", chunk.Length)
 			}
 		}
 	})
@@ -227,36 +226,4 @@ func (p *BufferPool) Put(buf []byte) {
 	default:
 		debug.Log("bufferPool is full; discarding the buffer")
 	}
-}
-
-type Cursor struct {
-	blobs   restic.IDs
-	BlobIdx int
-	Offset  uint
-}
-
-func AdvanceCursor(c Cursor, numBytes uint, blobSizes func(restic.ID) uint) (Cursor, error) {
-	for c.BlobIdx < len(c.blobs) {
-		blobSize := blobSizes(c.blobs[c.BlobIdx])
-		if blobSize == 0 {
-			return Cursor{}, fmt.Errorf("blob %v not in blobSizes", c.blobs[c.BlobIdx].Str())
-		}
-		r := blobSize - c.Offset
-
-		if numBytes < r {
-			c.Offset += numBytes
-			numBytes = 0
-			break
-		}
-
-		numBytes -= r
-		c.BlobIdx++
-		c.Offset = 0
-	}
-
-	if numBytes != 0 {
-		return Cursor{}, fmt.Errorf("cursor out of range; %d bytes over end position", numBytes)
-	}
-
-	return c, nil
 }

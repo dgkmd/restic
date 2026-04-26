@@ -2,6 +2,7 @@ package rechunker
 
 import (
 	"context"
+	"fmt"
 	"sync"
 
 	"github.com/restic/restic/internal/debug"
@@ -278,12 +279,23 @@ func (s *Scheduler) SetObsoleteBlobCallback(cb func(restic.IDs)) {
 	s.obsoleteBlobCB = cb
 }
 
-// ReadProgress computes progress of cursor for a file, while inferring src blob consumption and using that info to track blob usage.
-func (s *Scheduler) ReadProgress(cursor Cursor, bytesProcessed uint) (Cursor, error) {
-	start := cursor
-	end, err := AdvanceCursor(start, bytesProcessed, s.idx.BlobSize)
+func (s *Scheduler) newCursor(blobs restic.IDs) cursor {
+	if s == nil {
+		return cursor{}
+	}
+
+	return cursor{
+		blobs:    blobs,
+		blobSize: s.idx.BlobSize,
+	}
+}
+
+// progressCursor computes progress of cursor for a file, while inferring src blob consumption and using that info to track blob usage.
+func (s *Scheduler) progressCursor(c cursor, bytesProcessed uint) (cursor, error) {
+	start := c
+	end, err := c.Advance(bytesProcessed)
 	if err != nil {
-		return Cursor{}, err
+		return cursor{}, err
 	}
 
 	if s.obsoleteBlobCB == nil {
@@ -294,7 +306,7 @@ func (s *Scheduler) ReadProgress(cursor Cursor, bytesProcessed uint) (Cursor, er
 		return end, nil
 	}
 
-	blobs := cursor.blobs[start.BlobIdx:end.BlobIdx]
+	blobs := c.blobs[start.BlobIdx:end.BlobIdx]
 	var obsolete restic.IDs
 	s.mu.Lock()
 	for _, b := range blobs {
@@ -312,6 +324,43 @@ func (s *Scheduler) ReadProgress(cursor Cursor, bytesProcessed uint) (Cursor, er
 	s.obsoleteBlobCB(obsolete)
 
 	return end, nil
+}
+
+type cursor struct {
+	blobs    restic.IDs
+	BlobIdx  int
+	Offset   uint
+	blobSize func(restic.ID) uint
+}
+
+func (c cursor) Advance(numBytes uint) (cursor, error) {
+	if c.blobs == nil {
+		return cursor{}, nil
+	}
+
+	for c.BlobIdx < len(c.blobs) {
+		blobSize := c.blobSize(c.blobs[c.BlobIdx])
+		if blobSize == 0 {
+			return cursor{}, fmt.Errorf("unknown blob %v", c.blobs[c.BlobIdx].Str())
+		}
+		r := blobSize - c.Offset
+
+		if numBytes < r {
+			c.Offset += numBytes
+			numBytes = 0
+			break
+		}
+
+		numBytes -= r
+		c.BlobIdx++
+		c.Offset = 0
+	}
+
+	if numBytes != 0 {
+		return cursor{}, fmt.Errorf("cursor out of range; %d bytes over end position", numBytes)
+	}
+
+	return c, nil
 }
 
 // PrioritySelect selects from two channels with priority; first channel first.

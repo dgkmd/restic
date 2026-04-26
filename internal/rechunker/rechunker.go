@@ -231,8 +231,8 @@ func (rc *Rechunker) Rechunk(ctx context.Context, srcRepo, dstRepo restic.Reposi
 		defer debug.Log("Closing uploader")
 
 		wg, ctx := errgroup.WithContext(ctx)
-		rc.runWorkers(ctx, wg, numWorkers, downloader, uploader, scheduler.Next, scheduler.ReadProgress, bufferPool, p)
-		rc.runWorkers(ctx, wg, 1, downloader, uploader, scheduler.NextPriority, scheduler.ReadProgress, bufferPool, p)
+		rc.runWorkers(ctx, wg, numWorkers, downloader, uploader, scheduler.Next, scheduler.progressCursor, bufferPool, p)
+		rc.runWorkers(ctx, wg, 1, downloader, uploader, scheduler.NextPriority, scheduler.progressCursor, bufferPool, p)
 
 		return wg.Wait()
 	})
@@ -273,7 +273,7 @@ func (rc *Rechunker) setupCache(ctx context.Context, srcRepo PackLoader, schedul
 
 func (rc *Rechunker) runWorkers(ctx context.Context, wg *errgroup.Group, numWorkers int,
 	downloader restic.BlobLoader, uploader restic.BlobSaver, receiveJob func(context.Context) (*ChunkedFile, bool, error),
-	cursorProgressor func(Cursor, uint) (Cursor, error), bufferPool *BufferPool, p *Progress) {
+	cursorProgressor func(cursor, uint) (cursor, error), bufferPool *BufferPool, p *Progress) {
 	for range numWorkers {
 		wg.Go(func() error {
 			debug.Log("Starting worker")
@@ -382,10 +382,6 @@ func (rc *Rechunker) RewriteTrees(ctx context.Context, srcRepo, dstRepo restic.R
 	return result, nil
 }
 
-func (rc *Rechunker) NumFiles() int {
-	return len(rc.filesList)
-}
-
 func (rc *Rechunker) GetRewrittenTree(originalTree restic.ID) (restic.ID, error) {
 	newID, ok := rc.rewriteTreeMap[originalTree]
 	if !ok {
@@ -398,7 +394,11 @@ func (rc *Rechunker) TotalSize() uint64 {
 	return rc.totalSize
 }
 
-func (rc *Rechunker) PackCount() int {
+func (rc *Rechunker) NumFiles() int {
+	return len(rc.filesList)
+}
+
+func (rc *Rechunker) NumPacks() int {
 	return len(rc.idx.Packs())
 }
 
