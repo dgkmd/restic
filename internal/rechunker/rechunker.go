@@ -19,7 +19,7 @@ import (
 
 type Rechunker struct {
 	cfg Config
-	idx *Index
+	idx Index
 
 	filesList    []*ChunkedFile
 	totalSize    uint64
@@ -41,11 +41,11 @@ type ChunkedFile struct {
 	hashval restic.ID
 }
 
-// Index is immutable after Plan() returns.
-type Index struct {
-	BlobSize    map[restic.ID]uint          // blob ID -> blob size
-	BlobToPack  map[restic.ID]restic.ID     // blob ID -> pack ID
-	PackToBlobs map[restic.ID][]restic.Blob // pack ID -> list of blobs to be loaded from the pack
+type Index interface {
+	BlobSize(blobID restic.ID) (size uint)
+	BlobToPack(blobID restic.ID) (packID restic.ID)
+	PackToBlobs(packID restic.ID) (blobs []restic.Blob)
+	Packs() (packIDs restic.IDSet)
 }
 
 func NewRechunker(cfg Config) *Rechunker {
@@ -129,7 +129,33 @@ func gatherFileContents(ctx context.Context, repo restic.Loader, rootTrees resti
 	return filesList, totalSize, nil
 }
 
-func createIndex(filesList []*ChunkedFile, lookupBlob func(t restic.BlobType, id restic.ID) []restic.PackedBlob) (*Index, error) {
+type index struct {
+	blobSize map[restic.ID]uint          // blob ID -> blob size
+	blobIdx  map[restic.ID]restic.ID     // blob ID -> pack ID
+	packIdx  map[restic.ID][]restic.Blob // pack ID -> list of blobs to be loaded from the pack
+}
+
+func (i *index) BlobSize(id restic.ID) uint {
+	return i.blobSize[id]
+}
+
+func (i *index) BlobToPack(id restic.ID) restic.ID {
+	return i.blobIdx[id]
+}
+
+func (i *index) PackToBlobs(id restic.ID) []restic.Blob {
+	return i.packIdx[id]
+}
+
+func (i *index) Packs() restic.IDSet {
+	ids := restic.NewIDSet()
+	for id := range i.packIdx {
+		ids.Insert(id)
+	}
+	return ids
+}
+
+func createIndex(filesList []*ChunkedFile, lookupBlob func(t restic.BlobType, id restic.ID) []restic.PackedBlob) (Index, error) {
 	// collect blob usage info
 	blobCount := map[restic.ID]int{}
 	for _, file := range filesList {
@@ -145,8 +171,8 @@ func createIndex(filesList []*ChunkedFile, lookupBlob func(t restic.BlobType, id
 
 	// build blob lookup info
 	blobSize := map[restic.ID]uint{}
-	blobToPack := map[restic.ID]restic.ID{}
-	packToBlobs := map[restic.ID][]restic.Blob{}
+	blobIdx := map[restic.ID]restic.ID{}
+	packIdx := map[restic.ID][]restic.Blob{}
 	for blob := range blobCount {
 		packs := lookupBlob(restic.DataBlob, blob)
 		if len(packs) == 0 {
@@ -155,14 +181,14 @@ func createIndex(filesList []*ChunkedFile, lookupBlob func(t restic.BlobType, id
 		pb := packs[0]
 
 		blobSize[pb.Blob.ID] = pb.DataLength()
-		blobToPack[pb.Blob.ID] = pb.PackID
-		packToBlobs[pb.PackID] = append(packToBlobs[pb.PackID], pb.Blob)
+		blobIdx[pb.Blob.ID] = pb.PackID
+		packIdx[pb.PackID] = append(packIdx[pb.PackID], pb.Blob)
 	}
 
-	idx := &Index{
-		BlobSize:    blobSize,
-		BlobToPack:  blobToPack,
-		PackToBlobs: packToBlobs,
+	idx := &index{
+		blobSize: blobSize,
+		blobIdx:  blobIdx,
+		packIdx:  packIdx,
 	}
 
 	return idx, nil
@@ -373,7 +399,7 @@ func (rc *Rechunker) TotalSize() uint64 {
 }
 
 func (rc *Rechunker) PackCount() int {
-	return len(rc.idx.PackToBlobs)
+	return len(rc.idx.Packs())
 }
 
 func (rc *Rechunker) TotalAddedToDstRepo() uint64 {

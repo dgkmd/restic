@@ -12,7 +12,7 @@ import (
 type Scheduler struct {
 	mu sync.Mutex
 
-	idx *Index
+	idx Index
 
 	regularCh  <-chan *ChunkedFile
 	priorityCh <-chan *ChunkedFile
@@ -31,7 +31,7 @@ type Scheduler struct {
 	done chan struct{}
 }
 
-func NewScheduler(ctx context.Context, files []*ChunkedFile, idx *Index, usePriority bool) *Scheduler {
+func NewScheduler(ctx context.Context, files []*ChunkedFile, idx Index, usePriority bool) *Scheduler {
 	debug.Log(("Running NewScheduler()"))
 
 	wg, ctx := errgroup.WithContext(ctx)
@@ -281,7 +281,7 @@ func (s *Scheduler) SetObsoleteBlobCallback(cb func(restic.IDs)) {
 // ReadProgress computes progress of cursor for a file, while inferring src blob consumption and using that info to track blob usage.
 func (s *Scheduler) ReadProgress(cursor Cursor, bytesProcessed uint) (Cursor, error) {
 	start := cursor
-	end, err := AdvanceCursor(cursor, bytesProcessed, s.idx.BlobSize)
+	end, err := AdvanceCursor(start, bytesProcessed, s.idx.BlobSize)
 	if err != nil {
 		return Cursor{}, err
 	}

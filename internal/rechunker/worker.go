@@ -235,10 +235,10 @@ type Cursor struct {
 	Offset  uint
 }
 
-func AdvanceCursor(c Cursor, numBytes uint, blobSizes map[restic.ID]uint) (Cursor, error) {
+func AdvanceCursor(c Cursor, numBytes uint, blobSizes func(restic.ID) uint) (Cursor, error) {
 	for c.BlobIdx < len(c.blobs) {
-		blobSize, ok := blobSizes[c.blobs[c.BlobIdx]]
-		if !ok {
+		blobSize := blobSizes(c.blobs[c.BlobIdx])
+		if blobSize == 0 {
 			return Cursor{}, fmt.Errorf("blob %v not in blobSizes", c.blobs[c.BlobIdx].Str())
 		}
 		r := blobSize - c.Offset

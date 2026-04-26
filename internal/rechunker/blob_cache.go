@@ -15,7 +15,7 @@ type BlobCache struct {
 	mu sync.RWMutex
 	c  *simplelru.LRU[restic.ID, []byte]
 
-	idx *Index
+	idx Index
 
 	free, size int
 
@@ -31,7 +31,7 @@ type BlobCache struct {
 const overhead = len(restic.ID{}) + 64
 
 func NewBlobCache(ctx context.Context, size int, numDownloaders int,
-	repo PackLoader, idx *Index,
+	repo PackLoader, idx Index,
 	onReady func(blobIDs restic.IDs), onEvict func(blobIDs restic.IDs)) *BlobCache {
 	if size < 32*(1<<20) {
 		panic("Blob cache size should be at least 32 MiB!!")
@@ -115,7 +115,7 @@ func (c *BlobCache) startDownloaders(ctx context.Context, numDownloaders int,
 				// filter out ignored blobs
 				c.mu.RLock()
 				var filtered []restic.Blob
-				for _, blob := range c.idx.PackToBlobs[packID] {
+				for _, blob := range c.idx.PackToBlobs(packID) {
 					ignored := c.ignored.Has(blob.ID)
 					ready := c.c.Contains(blob.ID)
 					if !ignored && !ready {
@@ -260,13 +260,13 @@ func (c *BlobCache) asyncGet(ctx context.Context, id restic.ID, buf []byte) <-ch
 }
 
 func (c *BlobCache) requestDownload(ctx context.Context, id restic.ID) error {
-	packID, ok := c.idx.BlobToPack[id]
-	if !ok {
+	packID := c.idx.BlobToPack(id)
+	if packID.IsNull() {
 		return fmt.Errorf("unknown blob: %v", id.Str())
 	}
 
 	c.mu.Lock()
-	ok = c.waitList.Has(packID)
+	ok := c.waitList.Has(packID)
 	if !ok {
 		// queue pack download
 		c.waitList.Insert(packID)
@@ -332,7 +332,7 @@ type PackLoader interface {
 	LoadBlobsFromPack(context.Context, restic.ID, []restic.Blob, func(restic.BlobHandle, []byte, error) error) error
 }
 
-func WrapWithCache(ctx context.Context, repo PackLoader, cacheSize int, numDownloaders int, idx *Index,
+func WrapWithCache(ctx context.Context, repo PackLoader, cacheSize int, numDownloaders int, idx Index,
 	onReady, onEvict func(restic.IDs)) (*BlobLoaderWithCache, *BlobCache) {
 	r := &BlobLoaderWithCache{
 		repo:  repo,
